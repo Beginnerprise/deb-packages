@@ -1,0 +1,11 @@
+Package: bp-server
+Version: 0.1
+Provides: bp-server-global
+Conflicts: bp-server-global
+Replaces: bp-server-global
+Depends: bp-server-default-packages,bp-server-default-settings
+Architecture: all
+Maintainer: Software Engineering <engineering@beginnerprise.com>
+Description: Primary Beginnerprise Solutions Debian Server package
+ This package pulls all the necessary server package for Debian servers
+ on Beginnerprise hosted servers

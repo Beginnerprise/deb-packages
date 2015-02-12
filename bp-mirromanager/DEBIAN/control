@@ -1,10 +1,7 @@
 Package: srr-mirrormanager
-Version: $Revision: 209 $
+Version: 0.1
 Architecture: all
 Depends: srr-perl-modules, libexpect-perl
 Maintainer: Information Technology <internalsupport@srbok.com>
 Description: Installs an automated mirror manager
  Manages setting up the primary mirroring on a Smith Roberts server
-
-
-

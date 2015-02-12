@@ -1,0 +1,50 @@
+NAME=__PACKAGE__
+VERSION=__VERSION__
+
+RELEASE_SERVER=debian.bp.local
+RELEASE_PATH=/var/www/debian.bp.local
+REPOSITORY_VERSIONS=testing
+
+SVN=svn
+BUILD_COMMAND=dpkg-deb
+BUILD_DIRS=DEBIAN
+PACKAGE_NAME=$(NAME)_$(VERSION)_i386.deb
+
+all:	build
+
+clean:
+	-rm Makefile
+	-rm *.deb *.tmp
+	-rm -r package
+	-rm DEBIAN/*.tmp
+	-$(SVN) revert DEBIAN/control
+
+build:
+	mkdir -p package
+	cp -r $(BUILD_DIRS) package
+	find ./package -name .svn | xargs rm -r -f
+	$(BUILD_COMMAND) -b $(PWD)/package $(PACKAGE_NAME)
+
+release: build release-deb
+
+release-deb: $(REPOSITORY_VERSIONS)
+
+stable:
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/stable/main/binary-amd64
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/stable/main/binary-i386
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/stable/main/binary-amd64 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/stable/main/binary-amd64/Packages.gz'
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/stable/main/binary-i386 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/stable/main/binary-i386/Packages.gz'
+
+testing:
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/testing/main/binary-amd64
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/testing/main/binary-i386
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/testing/main/binary-amd64 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/testing/main/binary-amd64/Packages.gz'
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/testing/main/binary-i386 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/testing/main/binary-i386/Packages.gz'
+
+unstable:
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/unstable/main/binary-amd64
+	scp $(PACKAGE_NAME) $(RELEASE_SERVER):$(RELEASE_PATH)/dists/unstable/main/binary-i386
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/unstable/main/binary-amd64 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/unstable/main/binary-amd64/Packages.gz'
+	ssh $(RELEASE_SERVER) 'cd $(RELEASE_PATH); dpkg-scanpackages dists/unstable/main/binary-i386 /dev/null | gzip -9c > $(RELEASE_PATH)/dists/unstable/main/binary-i386/Packages.gz'
+
+install: release
