@@ -1,0 +1,800 @@
+#! /usr/bin/perl
+
+### BEGIN INIT INFO
+# Provides:          mirrormanager
+# Required-Start:    $network $local_fs $remote_fs
+# Required-Stop:     $network $local_fs $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Runs the Smith Roberts mirror manager
+### END INIT INFO
+
+
+use SRR::Standard;
+use Expect;
+use Data::Dumper;
+
+my %opts		= ();
+my $mirrorConfig	= undef;
+my $debug		= undef;
+my $isInit		= undef;
+
+my $STATIC_DISK_STATS_FILE	= '/proc/diskstats';
+my $STATIC_MIRROR_CRON_CONF	= '/etc/cron.d/mirrormanager';
+my $STATIC_RUN_DIR		= '/var/cache/mirrormanager';
+my $STATIC_MEM_INFO		= '/proc/meminfo';
+my $STATIC_MIRROR_CONFIGS	= "/etc/mirror.conf";
+my $STATIC_TMP_SFDISK_CONF	= "$STATIC_RUN_DIR/config.tmp";
+
+my $STATIC_CMD_SFDISK		= `which sfdisk`;
+chomp($STATIC_CMD_SFDISK);
+
+my $STATIC_CMD_RSYNC		= `which rsync`;
+chomp($STATIC_CMD_RSYNC);
+
+my $STATIC_CMD_GRUB		= `which update-grub`;
+chomp($STATIC_CMD_GRUB);
+
+my @defaultRsyncExcludes	= (
+				   '/proc',
+				   '/sys',
+				   '/dev',
+				   '/etc/fstab',
+				   $STATIC_MIRROR_CONFIGS,
+				   '/boot/grub/grub.cfg',
+				   '/etc/udev/rules.d',
+				   '/var/log/lastlog',
+				   '/mnt'
+				  );
+
+my @dirsToCreateOnNewDrives	= (
+				   '/proc',
+				   '/sys',
+				   '/dev',
+				   '/mnt',
+				  );
+
+
+$SIG{ALRM}			= sub { 
+    					print "Timeout!\n"; 
+					&mountConfiguredDrives();
+					&enableRsyncs();
+					exit(0) 
+				      };
+
+sub main
+{
+
+    &initialize();
+
+    #&debugCommands();
+    #exit;
+
+    &pi("Starting scan for new harddrives...");
+
+    if (&scanForNewDrives())
+    {
+	&pi("Found\n");
+	if ($isInit)
+	{
+	    alarm 5;
+	    if (!&askYN("New Hard Drives Detected.  Configure them now?"))
+	    {
+		exit(1);
+	    }
+	    alarm 0;
+	}
+	&configureNewDrives();
+	&mountConfiguredDrives();
+	&enableRsyncs();
+    }
+    else
+    {
+	&pi("None\n");
+
+	&mountConfiguredDrives();
+	&setupGrubForConfiguredDrives();
+	&enableRsyncs();
+    }
+
+}
+
+sub debugCommands
+{
+
+    $mirrorConfig 		= &readConfig($STATIC_MIRROR_CONFIGS);
+
+
+    my $tmpid 	= @{$mirrorConfig->{'mirrors'}};
+    my $tmpid2 	= @{$mirrorConfig->{'mounts'}};
+
+    &debug(1,"--------------------------" . $tmpid . " - " . $tmpid2);
+
+    print Dumper($mirrorConfig);
+
+    $rsyncCommand = 'rsync -rav / /mnt/sdb1/';
+    $rsyncTime = '0 2 * * *';
+
+    $mirrorConfig->{'mirrors'}[$tmpid]->{'rsyncCommand'}   = $rsyncCommand;
+    $mirrorConfig->{'mirrors'}[$tmpid]->{'rsyncTime'}      = $rsyncTime;
+    $mirrorConfig->{'mounts'}[$tmpid2]->{'source'}          = '/dev/sdb1';
+    $mirrorConfig->{'mounts'}[$tmpid2]->{'destination'}     = '/mnt/sdb1';
+
+    print Dumper($mirrorConfig);
+
+    &saveConfig($STATIC_MIRROR_CONFIGS,$mirrorConfig);
+
+}
+
+## Only prints if we are in init...
+sub pi
+{
+
+    my $msg	= shift;
+
+    &debug(3,"[PI]$msg");
+    if ($isInit)
+    {
+	print $msg;
+    }
+
+}
+
+sub mountConfiguredDrives
+{
+
+    my $isFailed	= undef;
+
+    foreach my $mount (@{$mirrorConfig->{'mounts'}})
+    {
+
+	&pi("Starting check for mount destination [$mount->{'source'}[0]]...");
+	if (!-d $mount->{'source'}[0])
+	{
+	    my $cmd	= "mkdir -p $mount->{'source'}[0]";
+	    system($cmd);
+	}
+
+	if (!-d $mount->{'destination'}[0])
+	{
+	    &pi("Failed\n");
+	}
+	else
+	{
+	    &pi("Done\n");
+	}
+
+	&pi("Starting Mount $mount->{'source'}[0] to $mount->{'destination'}[0]...");
+	my $cmd		= "mount $mount->{'source'}[0] $mount->{'destination'}[0]";
+	system($cmd);
+	&pi("Done\n");
+
+	&pi("Starting check to see if mount successful [$mount->{'source'}[0]]...");
+	my @lines 	= `mount`;
+	my $tmpTest	= $mount->{'source'}[0];
+	my $isSuccess	= undef;
+
+	foreach my $line (@lines)
+	{
+	    if ($line =~ /$tmpTest/)
+	    {
+		$isSuccess	= 1;
+		last;
+	    }
+	}
+
+	if (!$isSuccess)
+	{
+	    &pi("Failed\n");
+	    $isFailed		= 1;
+	} 
+	else
+	{
+	    &pi("Success\n");
+	}
+    }
+
+    if ($isFailed)
+    {
+	exit(1);
+    }
+
+}
+
+sub enableRsyncs
+{
+
+    my @chk		= @{$mirrorConfig->{'mirrors'}};
+
+    if (@chk)
+    {
+	&pi("Starting Enabling of Rsync Mirrors...");
+	&debug(11,"Sub enableRsyncs...");
+	open(OUT,">$STATIC_MIRROR_CRON_CONF");
+	foreach my $mirror (@{$mirrorConfig->{'mirrors'}})
+	{
+	    my $tmpTime		= $mirror->{'rsyncTime'}[0];
+	    my $tmpRsync	= $mirror->{'rsyncCommand'}[0];
+
+	    print OUT "$tmpTime root $tmpRsync\n";
+	    &debug(13,"Writing $tmpTime root $tmpRsync -> $STATIC_MIRROR_CRON_CONF");
+	}
+	close(OUT);
+	&pi("Done\n");
+    }
+
+}
+
+sub askYN
+{
+
+    my $msg	= shift;
+
+    print $msg . " [Y/n] : ";
+
+    $answer = <STDIN>;
+    chomp($answer);
+
+    if ($answer =~ /n/i)
+    {
+	return(undef);
+    }
+    else
+    {
+	return(1);
+    }
+
+    return(undef);
+
+}
+
+sub configureNewDrives
+{
+
+    my $response	= undef;
+    my $isMountOnBoot	= undef;
+    my $isMirror	= undef;
+
+    if (&askYN("Setup your new hard drive?"))
+    {
+    	my @newDrives		= &scanForNewDrives(); 
+	foreach my $drive (@newDrives)
+	{
+	    $swapSize = &scanForSwapSize();
+	    if (!$swapSize)
+	    {
+		&debug(1,"WE SHOULD ASK HOW BIG SWAP IS BUT FOR NOW WE EXIT");
+		exit(1);
+	    }
+
+	    my $junk		= undef;
+	    my $swapCylinders	= undef;
+	    my $totalCylinders	= undef;
+
+	    ## Configure where the drive should be mounted
+	    print "Mount /dev/$drive" . "1" . " to what mount point [/mnt/$drive" . "1" . "]:  ";
+	    my $answer	= <STDIN>;
+	    chomp($answer);
+	    if ($answer eq "")
+	    {
+		$mountSource 		= "/dev/$drive" . "1";
+		$mountDestination 	= "/mnt/$drive" . "1";
+	    }
+	    else
+	    {
+		$mountSource 		= "/dev/$drive" . "1";
+		$mountDestination 	= $answer;
+	    }
+
+	    if (!&askYN("Destination set to [$mountDestination].  Is this correct?"))
+	    {
+		&hError("Destination mount point configuration failed");
+	    }
+
+	    ## Configure what should be mirrored to this drive
+	    print "Mirror which path to $mountDestination: [Default: /]:  ";
+	    my $answer	= <STDIN>;
+	    chomp($answer);
+	    if ($answer eq "")
+	    {
+		$mirrorSource 		= '/';
+		$mirrorDestination 	= "/mnt/$drive" . "1/";
+	    }
+	    else
+	    {
+		$mirrorSource 		= $answer;
+		$mirrorDestination 	= "/mnt/$drive" . "1/";
+	    }
+
+	    if (!&askYN("Sync source set to [$mirrorSource] and destination set to [$mirrorDestination].  Is this correct?"))
+	    {
+		&hError("Mirror Config Failed");
+	    }
+
+	    # We should allow the user to configure RSYNC
+	    my @excludes	= @defaultRsyncExcludes;
+
+	    my $rsyncCommand	= undef;
+	    $rsyncCommand	= "rsync -rav";
+
+	    print "Building the Rsync command:\n";
+	    print "   Add --delete \n";
+	    $rsyncCommand = $rsyncCommand . " --delete";
+	    foreach my $exclude (@excludes)
+	    {
+		print "   Add Exclude: $exclude\n";
+		$rsyncCommand = $rsyncCommand . " --exclude=$exclude";
+	    }
+
+#FIXME:  We should let the user modify this at some point
+
+	    $rsyncCommand = $rsyncCommand . " $mirrorSource $mirrorDestination";
+	    print "\n";
+	    print "Rsync Command: $rsyncCommand\n";
+
+	    if (!&askYN("Is this correct?"))
+	    {
+		&hError("Failed to setup rsync command");
+	    }
+
+	    print "\nConfigure Rsync Time in cron format Default: [0 2,14 * * *]  ";
+	    $answer		= <STDIN>;
+	    chomp($answer);
+
+	    if ($answer eq "")
+	    {
+		$rsyncTime = '0 2,14 * * *';
+	    }
+	    else
+	    {
+		$rsyncTime = $answer;
+	    }
+	    print "Rsync Time: $rsyncTime\n";
+
+	    if (!&askYN("Is this correct?"))
+	    {
+		&hError("Failed to setup rsync time");
+	    }
+
+	    $junk 		= `$STATIC_CMD_SFDISK -g /dev/$drive`;
+	    $junk		=~ /.*?(\d+)\scylinders.*/;
+
+	    $totalCylinders	= $1;
+	    &debug(8,"Found total cylinders: $totalCylinders");
+
+	    $swapCylinders = ($swapSize / 8225280) * 2;
+	    ($swapCylinders,$junk) 	= split(/\./,$swapCylinders);
+	    $swapCylinders 		= $swapCylinders + 1;
+
+	    $primaryCylinders 	= $totalCylinders - $swapCylinders;
+
+	    $swapStartCylinder  = $primaryCylinders;
+
+	    $primaryCylinders	= $primaryCylinders - 63;
+
+	    print "Configuring /dev/$drive as:\n";
+	    print "   /dev/$drive" . "1" . " [$primaryCylinders]Cyls" . " TYPE: 83\n";
+	    print "   /dev/$drive" . "2" . " [$swapCylinders]Cyls" . " TYPE: 5\n";
+	    print "   /dev/$drive" . "5" . " [$swapCylinders]Cyls" . " TYPE: 82\n";
+	    print "   Setting /dev/$drive" . "1" . " for boot\n";
+	    print "\n";
+	    if (&askYN("Is this correct"))
+	    {
+		&debug(1,"Configure the partition");
+		open(OUT,">$STATIC_TMP_SFDISK_CONF");
+
+		print OUT "63,$primaryCylinders,83,*\n";
+		print OUT "$swapStartCylinder,$swapCylinders,E\n";
+		print OUT "0,0,\n";
+		print OUT "0,0,\n";
+		print OUT "$swapStartCylinder,$swapCylinders,82\n";
+
+		close(OUT);
+
+		my $cmd		= undef;
+
+	        print "Writing partition information to /dev/$drive...";
+		$cmd = "sfdisk /dev/$drive < $STATIC_TMP_SFDISK_CONF";
+		system($cmd);
+		print "Done\n";
+
+	        print "Deleting $STATIC_TMP_SFDISK_CONF...";
+		$cmd = "rm $STATIC_TMP_SFDISK_CONF";
+		system($cmd);
+		print "Done\n";
+
+	   	print "Making ext3 filesystem on /dev/$drive" . "1" . "...";
+		$cmd = "mkfs.ext4 /dev/$drive" . "1";
+		system($cmd);
+		print "Done\n";
+
+	   	print "Making swap filesystem on /dev/$drive" . "5" . "...";
+		$cmd = "mkswap /dev/$drive" . "5";
+		system($cmd);
+		print "Done\n";
+
+	   	print "Making mount point at /mnt/$drive" . "1" . "...";
+		$cmd = "mkdir $mountDestination";
+		system($cmd);
+		print "Done\n";
+
+	   	print "Mounting /dev/$drive" . "1" . " at " . "/mnt/$drive" . "1" . "...";
+		$cmd = "mount /dev/$drive" . "1" . " " . "/mnt/$drive" . "1";;
+		system($cmd);
+		print "Done\n";
+
+		print "Checking if mount successful...";
+		my @lines 	= `mount`;
+		my $tmpTest	= "$drive" . "1";
+		my $isSuccess	= undef;
+
+		foreach my $line (@lines)
+		{
+		    if ($line =~ /$tmpTest/)
+		    {
+			$isSuccess	= 1;
+			last;
+		    }
+		}
+
+		if (!$isSuccess)
+		{
+		    print "Failed\n";
+		    exit(1);
+		} 
+		else
+		{
+		    print "Done\n";
+		}
+
+		foreach my $dir (@dirsToCreateOnNewDrives)
+		{
+		    print "Making dir /mnt/$drive" . "1" . $dir . "...";
+		    $cmd = "mkdir /mnt/$drive" . "1" . $dir;
+		    system($cmd);
+		    print "Done\n";
+		}
+
+	   	print "Running initial rsync...\n";
+		sleep(2);
+		$cmd 		= $rsyncCommand;
+		system($cmd);
+
+	   	print "Sync /boot with $mountDestination/boot/...";
+		$cmd = "$STATIC_CMD_RSYNC -rav /boot/ $mountDestination/boot/";
+		system($cmd);
+		print "Done\n";
+
+	   	print "Sync /etc with $mountDestination/etc/...";
+		$cmd = "$STATIC_CMD_RSYNC -rav --exclude=/udev/rules.d /etc/ $mountDestination/etc/";
+		system($cmd);
+		print "Done\n";
+
+		my $device	= "/dev/$drive";
+
+		&updateDestinationFstab($device);
+		&configureGrub($device);
+
+                #Figure out how many mirros we already have... add 1
+		my $tmpid 	= @{$mirrorConfig->{'mirrors'}};
+		my $tmpid2 	= @{$mirrorConfig->{'mounts'}};
+
+		$mirrorConfig->{'mirrors'}[$tmpid]->{'rsyncCommand'} 	= $rsyncCommand;
+		$mirrorConfig->{'mirrors'}[$tmpid]->{'rsyncTime'}	= $rsyncTime;
+		$mirrorConfig->{'mounts'}[$tmpid2]->{'source'}		= $mountSource;
+		$mirrorConfig->{'mounts'}[$tmpid2]->{'destination'}	= $mountDestination;
+		$mirrorConfig->{'mounts'}[$tmpid2]->{'device'}		= $device;
+
+
+		&saveConfig($STATIC_MIRROR_CONFIGS,$mirrorConfig);
+    		$mirrorConfig 		= &readConfig($STATIC_MIRROR_CONFIGS);
+
+
+
+	    }
+	    else
+	    {
+		&debug(1,"Exiting");
+		exit(1);
+	    }
+	    
+
+	}
+    }
+    else
+    {
+	return(undef);
+    }
+}
+
+sub setupGrubForConfiguredDrives
+{
+    foreach my $mount (@{$mirrorConfig->{'mounts'}})
+    {
+	&updateDestinationFstab($mount->{'device'}[0]);
+	&configureGrub($mount->{'device'}[0]);
+    }
+}
+
+sub updateDestinationFstab
+{
+
+    # We need to figure out the block ID of the drives in the main FSTAB of the system
+    # Then swap them out on the destination hard drive
+    &debug(11,"...updateDestinationFstab");
+    my $dest 		= shift;
+
+    &debug(12,"Working on Destination [$dest]");
+
+    my $fromMainUUID	= `blkid | grep /dev/sda | grep ext`;
+    $fromMainUUID	=~ s/.*(UUID=".*?").*/$1/;
+    $fromMainUUID	=~ s/"//g;
+    my $fromSwapUUID	= `blkid | grep /dev/sda | grep swap`;
+    $fromSwapUUID	=~ s/.*(UUID=".*?").*/$1/;
+    $fromSwapUUID	=~ s/"//g;
+    chomp($fromMainUUID);
+    chomp($fromSwapUUID);
+
+    &debug(14,"From UUID Main: $fromMainUUID");
+    &debug(14,"From UUID Swap: $fromSwapUUID");
+
+    my $destMain	= $dest . "1";
+    my $destSwap	= $dest . "5";
+
+    my $toMainUUID	= `blkid | grep $destMain`;
+    $toMainUUID	=~ s/.*(UUID=".*?").*/$1/;
+    $toMainUUID	=~ s/"//g;
+    chomp($toMainUUID);
+    my $toSwapUUID	= `blkid | grep $destSwap`;
+    $toSwapUUID	=~ s/.*(UUID=".*?").*/$1/;
+    $toSwapUUID	=~ s/"//g;
+    chomp($toSwapUUID);
+
+    &debug(14,"To UUID Main: $toMainUUID");
+    &debug(14,"To UUID Swap: $toSwapUUID");
+
+    $destMain		=~ s/dev/mnt/;
+
+    my $fstab		= "$destMain/etc/fstab";
+
+    &debug(14,"Destination FSTAB: $fstab");
+    open(OUT,">$fstab.tmp");
+    open(IN,"<$fstab");
+
+    while (<IN>)
+    {
+	$line	= $_;
+	if ($line =~ /$fromMainUUID/)
+	{
+	    &debug(15,"Swapping Main UUID:  $fromMainUUID -> $toMainUUID");
+	    $line =~ s/$fromMainUUID/$toMainUUID/;
+	    &debug(19,"L: $line");
+	    print OUT $line;
+	    next;
+	}
+	elsif ($line =~ /$fromSwapUUID/)
+	{
+	    &debug(15,"Swapping Swap UUID:  $fromSwapUUID -> $toSwapUUID");
+	    $line =~ s/$fromSwapUUID/$toSwapUUID/;
+	    &debug(19,"L: $line");
+	    print OUT $line;
+	    next;
+	}
+	else
+	{
+	    print OUT $line;
+	    chomp($line);
+	    &debug(19,"L: $line");
+	    next;
+	}
+    }
+
+    close(IN);
+    close(OUT);
+
+    my $cmd	= "mv $fstab.tmp $fstab";
+    &debug(19,"C: $cmd");
+    system($cmd);
+
+}
+
+sub configureGrub
+{
+    my $dest 		= shift;
+
+    my $device		= $dest;
+
+    $dest 		=~ s/dev/mnt/;
+
+    &debug(5,"[PI] Setting up grub on $dest...");
+    &pi("Setting up grub on $dest...");
+
+    my $destTemp	= $dest . "1";
+
+    my $cmd 	= undef;
+    $cmd	.= "mount --bind /dev $destTemp/dev; ";
+    $cmd 	.= "mount --bind /proc $destTemp/proc; "; 
+    $cmd	.= "mount --bind /sys $destTemp/sys; ";
+    $cmd	.= "chroot $destTemp update-grub; ";
+    $cmd	.= "chroot $destTemp grub-install $device; ";
+    $cmd	.= "umount $destTemp/dev; ";
+    $cmd	.= "umount $destTemp/sys; ";
+    $cmd	.= "umount $destTemp/proc";
+    &debug(9,"C: $cmd");
+    system($cmd);
+
+    $cmd	= undef;
+    $cmd	.= "grub-install --root-directory=$destTemp $device";
+    &debug(9,"C: $cmd");
+    system($cmd);
+
+    &pi("Done\n");
+}
+
+sub scanForSwapSize
+{
+
+    if (!-f $STATIC_MEM_INFO) 
+    {
+	&hError("Can't find $STATIC_MEM_INFO");
+    }
+
+    my @lines 		= `cat $STATIC_MEM_INFO`;
+
+    foreach my $line (@lines)
+    {
+	if ($line =~ /MemTotal:\s*(\d+)\s*/)
+	{
+	    my $tmp = $1;
+	    $tmp = $tmp * 1024;
+	    return($tmp);
+	}
+    }
+
+    return(undef);
+}
+
+sub scanForNewDrives
+{
+
+    my @lines		= ();
+    my @newDrives	= ();
+    my @drives		= ();
+
+    if (!-f $STATIC_DISK_STATS_FILE)
+    {
+	&hError("Proc file system or $STATIC_DISK_STATS_FILE not found");
+    }
+
+    @lines		= `cat $STATIC_DISK_STATS_FILE`;
+
+    foreach my $line (@lines)
+    {
+	if ($line =~ /\s*8\s*\d+\s(sd\w)\s\d+.*/)
+	{
+	    &debug(7,"Found Drive: $1");
+	    push(@drives,$1);
+	}
+
+    }
+
+    foreach my $drive (@drives)
+    {
+	$found	= undef;
+	foreach my $line (@lines)
+	{
+	    if ($line =~ /\s+$drive\d+\s+/)
+	    {
+		$found = 1;
+		last;
+	    }
+	}
+	
+	if (!$found)
+	{
+	    push(@newDrives,$drive);
+	}
+    }
+
+    if ($debug && @newDrives)
+    {
+
+	&debug(6,"New Drives Found");
+	foreach my $newDrive (@newDrives)
+	{
+	    &debug(6,"    DRIVE: $newDrive");
+	}
+
+    }
+
+    return(@newDrives);
+
+}
+
+sub initialize
+{
+
+    use Getopt::Std;
+
+    getopts('d:',\%opts);
+
+    if ($opts{'d'})
+    {
+	$debug		= $opts{'d'};
+	&setDebugLevel($opts{'d'});
+	&debug(1,"Setting debug level: $debug");
+    }
+
+    if (!-f $STATIC_CMD_RSYNC)
+    {
+	&sError("Can not locate command rsync");
+	exit(0);
+    }
+
+    if (!-f $STATIC_CMD_SFDISK)
+    {
+	&sError("Can not locate command sfdisk");
+	exit(0);
+    }
+
+    if (!-f $STATIC_CMD_GRUB)
+    {
+	&sError("Can not locate command grub");
+	exit(0);
+    }
+
+    if (!-d $STATIC_RUN_DIR)
+    {
+	$cmd	= "mkdir -p $STATIC_RUN_DIR";
+	system($cmd);
+
+	if (!-d $STATIC_RUN_DIR)
+	{
+	    &sError("Unable to create $STATIC_RUN_DIR");
+	    exit(0);
+	}
+
+    }
+
+    if ($ARGV[0] eq 'stop')
+    {
+	exit(0);
+    }
+
+    if ($ARGV[0] eq 'start')
+    {
+	$isInit	= 1;
+    }
+
+    if (!-f $STATIC_MIRROR_CONFIGS)
+    {
+	my $cmd = "touch $STATIC_MIRROR_CONFIGS";
+	system($cmd);
+
+	if (!-f $STATIC_MIRROR_CONFIGS)
+	{
+	    &hError("Could not create mount config file: $STATIC_MIRROR_CONFIGS");
+	}
+	else
+	{
+	    my %tmpHash		= ();
+	    $tmpHash{'tmpkey'} 	= 'tmpval';
+	    &saveConfig($STATIC_MIRROR_CONFIGS,\%tmpHash)
+	}
+
+    }
+
+    #Remove cron config in case we fail.  File is recreated each successful run
+    if (-f $STATIC_MIRROR_CRON_CONF)
+    {
+	&debug(6,"Removing $STATIC_MIRROR_CRON_CONF");
+	$cmd = "rm $STATIC_MIRROR_CRON_CONF";
+	system($cmd);
+    }
+
+    $mirrorConfig 	= &readConfig($STATIC_MIRROR_CONFIGS);
+
+}
+
+&main();
+exit(0);

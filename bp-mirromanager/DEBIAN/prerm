@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -e
+
+installinit_error() {
+	status=$?
+	start-stop-daemon --stop --quiet --oknodo && exit 0
+	exit $status
+}
+
+if [ -x "/etc/init.d/mirrormanager" ]; then
+	if [ -x "`which invoke-rc.d 2>/dev/null`" ]; then
+		invoke-rc.d mirrormanager stop || installinit_error
+	else
+		/etc/init.d/mirrormanager stop || installinit_error
+	fi
+fi
+

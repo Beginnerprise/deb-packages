@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -e
+
+if [ "$1" = "configure" ]; then
+        update-rc.d mirrormanager defaults
+        /etc/init.d/mirrormanager start
+fi
+
+installinit_error() {
+	exit $?
+}
+
