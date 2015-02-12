@@ -1,0 +1,504 @@
+#! /usr/bin/perl
+#######################################################################
+##
+##
+##
+##
+##
+##
+#######################################################################
+#######################################################################
+## Libraries -- Do not modify
+#######################################################################
+
+use Getopt::Std;
+
+#######################################################################
+## Global Variables
+#######################################################################
+
+my %templateValues	= ();
+my $macAddress		= undef;
+my $emailAddress	= undef;
+my $emailNotifications	= undef;
+my $debugLvl		= 0;
+my @templateFileLines	= ();
+my $tmpSipFile		= '/tmp/sip.conf.tmp';
+my $phoneConfigDir	= '/tftpboot';
+my $tmpPhoneFile	= '/tmp/phone.conf.tmp';
+my $tmpVoiceMailFile	= '/tmp/vmail.conf.tmp';
+my $templateFile 	= '/tftpboot/000000000000-phone.template';
+
+$templateValues{SERVERIP} = 'phones1.bp.local';
+
+## FIXME This should be configurable at the command line
+$sipConfigFile = '/etc/asterisk/sip.conf';
+
+## FIXME This should be configurable at the command line
+$voicemailConfigFile = '/etc/asterisk/voicemail.conf';
+
+#######################################################################
+## Main Program
+##
+## Do not write after this line
+## --------------------------------------------------------------------
+#######################################################################
+
+&main();
+exit(0);
+
+sub main {
+
+  &getCommandLineArguments();
+  &createSipConfig();
+  &createPhoneConfig();
+  &createVoiceMailConfig();
+  &commitChanges();
+  &createPhoneDirectory();
+  &printResults();
+
+}
+
+sub createVoiceMailConfig {
+
+  &debug(9,"Reading in $voicemailConfigFile");
+  if (!-f $voicemailConfigFile) { &error("Can't find Voicemail Config File") };
+  open(FILE,"<$voicemailConfigFile");
+  @vmLines = <FILE>;
+  close(FILE);
+
+  $options = "";
+  $options = $options . "saycid=yes|dialout=fromvm|callback=fromvm|review=yes|";
+  $options = $options . "saydurationm=1|sayduration=yes|envelope=yes|operator=yes";
+
+  if ($emailNotifications) { $options = $options . "|delete=1|attach=yes" };
+
+  $newLine = "";
+  $newLine = $newLine . $templateValues{EXTENSION};
+  $newLine = $newLine . " => ";
+  $newLine = $newLine . $templateValues{PASSWORD};
+  $newLine = $newLine . ",";
+  $newLine = $newLine . $templateValues{FULLNAME};
+  $newLine = $newLine . ",";
+  $newLine = $newLine . $emailAddress;
+  $newLine = $newLine . ",";
+  $newLine = $newLine . ",";
+  $newLine = $newLine . $options;
+  $newLine = $newLine . "\n";
+
+  foreach $line (@vmLines) {
+
+    if ($line =~ m/$templateValues{EXTENSION} =>/) {
+      $foundExtension = 1;
+      &debug(9,"Found the Extension in the Voicemail Config");
+      &debug(10,"Adding line: $newLine");
+      $line =~ s/^.*$/$newLine/;
+
+    }
+
+  }
+
+  if (!$foundExtension) {
+
+    push(@vmLines,$newLine);
+
+  }
+
+}
+
+sub printResults {
+
+
+  if (!$emailNotifications) { $emailNotifications = 'no' };
+
+  print <<"    EOF";
+
+  Phone Added
+  ------------------
+  Extension 		$templateValues{EXTENSION}
+  Password  		$templateValues{PASSWORD}
+  Voicemail 		$templateValues{EXTENSION}
+  CallerID 		$templateValues{FULLNAME}
+  PhoneLabel 		$templateValues{LABEL}
+  LineKeys 		$templateValues{NUMBEROFLINEKEYS}
+  PhoneSwitchIP 	$templateValues{SERVERIP}
+  PhoneSwitchPort 	$templateValues{SERVERPORT}
+  VmailToEmail	$emailNotifications
+  VmailEmailAddress	$emailAddress
+  PhoneConfig		$phoneConfigDir/$macAddress-phone.cfg
+  EOF
+
+}
+
+sub commitChanges {
+
+  &debug(5,"Creating Temp Sip Config File");
+  if (-f $tmpSipFile) { &error("Temporary Sip File Already Exists") };
+  open(SIPCONFIG,"> $tmpSipFile");
+  foreach (@sipLines) { print SIPCONFIG };
+  close(SIPCONFIG);
+
+  &debug(5,"Creating Temp Voicemail Config File");
+  if (-f $tmpVoiceMailFile) { &error("Temporary Voicemail Config File Already Exists") };
+  open(VOICEMAILCONFIG,"> $tmpVoiceMailFile");
+  foreach (@vmLines) { print VOICEMAILCONFIG };
+  close(VOICEMAILCONFIG);
+
+  &debug(5,"Creating Temp Phone Config File");
+  if (-f $tmpPhoneFile) { &error("Temporary Phone Config File Already Exists") };
+  open(PHONECONFIG,"> $tmpPhoneFile");
+  foreach (@templateFileLines) { print PHONECONFIG };
+  close(PHONECONFIG);
+
+  if (!-f $sipConfigFile) { &error("Ouch - Now I can't file $sipConfigFile") };
+  `mv $sipConfigFile $sipConfigFile.bak`;
+  `mv $tmpSipFile $sipConfigFile`;
+
+  if (!-f $voicemailConfigFile) { &error("Ouch - Now I can't file $voicemailConfigFile") };
+  `mv $voicemailConfigFile $voicemailConfigFile.bak`;
+  `mv $tmpVoiceMailFile $voicemailConfigFile`;
+
+  if (-f $tmpSipFile) { &error("Sip Config File Move Failed") };
+  `mv $tmpPhoneFile $phoneConfigDir/$macAddress-phone.cfg`;
+
+  if (-f $tmpPhoneFile) { &error("Phone Config File Move Failed") };
+
+  &debug(5,"Changing Permissions on $phoneConfigDir/$macAddress-phone.cfg to rw");
+  `chmod 666 $phoneConfigDir/$macAddress-phone.cfg`;
+
+  &debug(5,"Creating Symlink to directory for phone");
+  if (-f "$phoneConfigDir/$macAddress-directory.xml") { `rm $phoneConfigDir/$macAddress-directory.xml` };
+  `ln -s /tftpboot/000000000000-directory.xml $phoneConfigDir/$macAddress-directory.xml`;
+
+  &debug(5,"Now reloading Asterisk with updated configs");
+  `asterisk -rx'reload'`;
+
+}
+
+sub createPhoneDirectory {
+
+  &debug(5,"Creating the Phone Directory");
+  ####  FIXME This should DEFINATELY be cleaned up... really quick dir creater
+  @files = `ls /tftpboot/*-phone.cfg`;
+
+  $head = "";
+  $head = $head . "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n";
+  $head = $head . "<directory>\n";
+  $head = $head . "  <item_list>\n";
+  push(@newDirectory,$head);
+
+  foreach $file (@files) {
+
+
+    &debug(10,"Working on file $file");
+    $name 	= undef;
+    $exten 	= undef;
+
+    chomp($file);
+    open(INPUT,"<$file");
+    while (<INPUT>) {
+
+      &debug(10,"Line: $_");
+      if (m/displayName=\"(.*?)\"/) { $name = $1 };
+      if (m/reg.1.address=\"(.*?)\"/) { $exten = $1 };
+
+    }
+    close(INPUT);
+
+    if (!$name) { next };
+
+    $template = "";
+    $template = $template . "    <item>\n";
+    $template = $template . "          <ln></ln>\n";
+    $template = $template . "          <fn>" . $name . "</fn>\n";
+    $template = $template . "          <ct>" . $exten . "</ct>\n";
+    $template = $template . "          <rt></rt>\n";
+    $template = $template . "          <dc />\n";
+    $template = $template . "          <sd></sd>\n";
+    $template = $template . "          <ad>0</ad>\n";
+    $template = $template . "          <ar>0</ar>\n";
+    $template = $template . "          <bw>0</bw>\n";
+    $template = $template . "          <bb>0</bb>\n";
+    $template = $template . "     </item>\n";
+    $template = $template . "     ???\n";
+
+    push(@newDirectory,$template);
+
+  }
+
+  $foot = $foot . "  </item_list>\n";
+  $foot = $foot . "</directory>\n";
+  push(@newDirectory,$foot);
+
+  &debug(5,"Creating tmp file $tmpDirectoryFile");
+  $tmpDirectoryFile = '/tmp/tmp.phone.xml';
+  open(OUTPUT,">$tmpDirectoryFile");
+  foreach (@newDirectory) { print OUTPUT };
+  close(OUTPUT);
+
+  &debug(5,"mv $tmpDirectoryFile /tftpboot/000000000000-directory.xml");
+  `mv $tmpDirectoryFile /tftpboot/000000000000-directory.xml`;
+  &debug(5,"chmod 644 /tftpboot/000000000000-directory.xml");
+  `chmod 644 /tftpboot/000000000000-directory.xml`;
+  print "Updated The Main Directory File /tftpboot/000000000000-directory.xml\n";
+
+}
+
+sub createPhoneConfig {
+
+  &debug(9,"Opening Template File: $templateFile");
+
+  open(FILE,"<$templateFile");
+  @templateFileLines = <FILE>;
+  close(FILE);
+
+  &debug(9,"Making Changes to the Temp File");
+  foreach $line (@templateFileLines) {
+
+    foreach $key (keys %templateValues) {
+
+      if ($line =~ m/\_\_$key\_\_/) {
+        $line =~ s/\_\_$key\_\_/$templateValues{$key}/g;
+      }
+
+    }
+
+  }
+
+}
+
+sub createSipConfig {
+
+  &debug(9,"Reading in $sipConfigFile");
+  if (!-f $sipConfigFile) { &error("Can't find SIP Config File") };
+  open(FILE,"<$sipConfigFile");
+  @sipLines = <FILE>;
+  close(FILE);
+
+  foreach $line (@sipLines) {
+
+    if ($line =~ m/\[$templateValues{EXTENSION}\]/) {
+      $foundPhone = 1;
+      $inConfig = 1;
+      &debug(9,"Found the Phone in the Sip Config");
+      next;
+    }
+    if ($line =~ m/\[\w+\]/) { $inConfig = undef };
+    if ($inConfig && $line =~ m/secret=/) {
+      $line =~ s/secret=\w+/secret=$templateValues{PASSWORD}/;
+      &debug(9,"Changing the secret to $templateValues{PASSWORD}");
+    }
+
+    if ($inConfig && $line =~ m/username=/) {
+      $line =~ s/username=\w+/username=$templateValues{EXTENSION}/;
+      &debug(9,"Changing the username to $templateValues{EXTENSION}");
+    }
+
+    if ($inConfig && $line =~ m/mailbox=/) {
+      $line =~ s/mailbox=\w+/mailbox=$templateValues{EXTENSION}/;
+      &debug(9,"Changing the mailbox to $templateValues{EXTENSION}");
+    }
+
+    #	if ($inConfig && $line =~ m/callerid=/) {
+      #	    $line =~ s/callerid=.*/callerid=$templateValues{FULLNAME} <$templateValues{EXTENSION}>/;
+      #	    &debug(9,"Changing the callerid to $templateValues{FULLNAME} <$templateValues{EXTENSION}>");
+      #	}
+    }
+
+    if (!$foundPhone) {
+
+      $newphone = "";
+      $newphone = $newphone . "[$templateValues{EXTENSION}]\n";
+      $newphone = $newphone . "type=friend\n";
+      $newphone = $newphone . "context=main\n";
+      $newphone = $newphone . "secret=$templateValues{PASSWORD}\n";
+      $newphone = $newphone . "host=dynamic\n";
+      #	$newphone = $newphone . "callerid=$templateValues{FULLNAME} <$templateValues{EXTENSION}>\n";
+      $newphone = $newphone . "dtmfmode=rfc2833\n";
+      $newphone = $newphone . "username=$templateValues{EXTENSION}\n";
+      $newphone = $newphone . "mailbox=$templateValues{EXTENSION}\n";
+      $newphone = $newphone . "disallow=all\n";
+      $newphone = $newphone . "allow=ulaw\n";
+      $newphone = $newphone . "progressinband=no\n";
+      $newphone = $newphone . "qualify=yes\n";
+      $newphone = $newphone . "\n";
+      push(@sipLines,$newphone);
+
+    }
+
+  }
+
+  sub debug {
+
+    my $lvl 	= shift;
+    my $msg	= shift;
+
+    if ($debugLvl >= $lvl) { print "$lvl: $msg\n" }
+    return();
+
+  }
+
+  sub error {
+
+    my $msg 	= shift;
+
+    print "ERROR: $msg\n";
+
+    if (-f $tmpSipFile) { `rm $tmpSipFile` };
+    if (-f $tmpPhoneFile) { `rm $tmpPhoneFile` };
+    if (-f $tmpVoiceMailFile) { `rm $tmpVoiceMailFile` };
+    exit(1);
+
+  }
+
+  sub getMacAddress {
+
+    ### FIXME Clean this up
+    my $ipAddr = shift;
+    my $ret = undef;
+    my $mac = undef;
+    &debug(5,"Attempting to discover Mac Address by IP");
+
+    &debug(7,"Trying to ping $ipAddr");
+    `ping -c 1 $ipAddr`;
+    $ret = `arp -an | grep $ipAddr`;
+    if ($ret =~ m/^.*?\(\d+\..*\)\sat\s([\w+:]*\w\w)\s\[e.*$/) {
+      $mac = $1;
+      &debug(7,"Found Mac Address $mac");
+    }
+
+    return($mac);
+
+  }
+
+  sub usage {
+
+    print "createphoneconfigs -m <mac> [-h <host>] -e <extension> [-E emailaddr] [-p port] [-c cidname] \n";
+    print "                   [-n label] [-s secret] [-t filename] [-x] [-I ipaddr]\n";
+    print <<"    EOF";
+
+    -I ipaddr	      Try to find mac address from IP
+    -m macaddress     Mac Address of the phone
+    -h host 	      Hostname or IP address of phone switch (Default: psw)
+    -e extension      Extension for this phone
+    -E emailaddr      Email Address
+    -p port	      Port to connect to (Default: 5060)
+    -l linekeys	      Number of Line Keys to populate (Default: 2)
+    -n labelname      Name to display on the phone (Default: Extension)
+    -c calleridname   Name to display when calling other people (Default: Extension)(use this Joe)
+    -s phonespassword The password for this phone (Default: Extension)
+    -d debuglvl       Set the debug output lvl
+    -t templatefile   Template File to Use (Default: 000000000000-phone.template)
+    -x 		      Generate XML Files (Will ignore other args and do this only)
+
+    EOF
+
+  }
+
+  sub getCommandLineArguments {
+
+    my %opts		= ();
+
+    getopts('xm:I:h:e:E:p:l:n:c:s:d:t:', \%opts);
+
+    if (!$opts{d}) {
+      $debugLvl = 0;
+    } else {
+      $debugLvl = $opts{d};
+      &debug(7,"Assigned Debug Lvl $opts{d}");
+    }
+
+    if ($opts{x}) {
+
+      &createPhoneDirectory();
+      exit(0);
+
+    }
+
+    if ($opts{I}) {
+      $res = &getMacAddress($opts{I});
+      if ($res) { $opts{m} = $res };
+    }
+
+
+    if (!$opts{m}) {
+      &usage();
+      &error("No Mac Address Specified");
+    } else {
+      $macAddress = lc($opts{m});
+      $macAddress =~ s/://g;
+
+      if ($macAddress !~ /\w\w\w\w\w\w\w\w\w\w\w\w/) {
+        &usage();
+        &error("Possibly Malformed MacAddress");
+      }
+
+      &debug(7,"Assigned Mac Address $opts{m}");
+
+    }
+
+    if (!$opts{e}) {
+      &usage();
+      &error("No Extension Specified");
+    } else {
+      $templateValues{EXTENSION} = $opts{e};
+      &debug(7,"Assigned Extension $opts{e}");
+    }
+
+    if (!$opts{h}) {
+    } else {
+      $templateValues{SERVERIP} = $opts{h};
+      &debug(7,"Assigned Switch Hostname $opts{h}");
+    }
+
+    if ($opts{E}) {
+      $emailNotifications = 'yes';
+      $emailAddress = $opts{E};
+      &debug(7,"Assigned Email Notifications $opts{E}");
+    }
+
+    if (!$opts{p}) {
+      $templateValues{SERVERPORT} = 5060;
+    } else {
+      $templateValues{SERVERPORT} = $opts{p};
+      &debug(7,"Assigned Server Port $opts{p}");
+    }
+
+    if (!$opts{l}) {
+      $templateValues{NUMBEROFLINEKEYS} = 2;
+    } else {
+      $templateValues{NUMBEROFLINEKEYS} = $opts{l};
+      &debug(7,"Assigned Number Of Line Keys $opts{l}");
+    }
+
+    if (!$opts{n}) {
+      $templateValues{LABEL} = $opts{e};
+    } else {
+      $templateValues{LABEL} = $opts{n};
+      &debug(7,"Assigned Button Label $opts{n}");
+    }
+
+    if (!$opts{c}) {
+      $templateValues{FULLNAME} = $opts{e};
+    } else {
+      $templateValues{FULLNAME} = $opts{c};
+      &debug(7,"Assigned Caller ID $opts{c}");
+    }
+
+    if (!$opts{s}) {
+      $templateValues{PASSWORD} = $opts{e};
+    } else {
+      $templateValues{PASSWORD} = $opts{s};
+      &debug(7,"Assigned Phone Secret $opts{s}");
+    }
+
+    if (!$opts{t}) {
+      if (!-f $templateFile) { &error("Couldn't find template file") };
+    } else {
+      $templateFile = $opts{t};
+      if (!-f $templateFile) { &error("Couldn't find template file") };
+      &debug(7,"Assigned Template File $opts{t}");
+    }
+
+  }
+  

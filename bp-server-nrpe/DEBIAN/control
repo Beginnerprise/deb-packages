@@ -1,0 +1,10 @@
+Package: bp-server-nrpe
+Version: $Revision: 207 $
+Architecture: all
+Depends: bp-perl-modules, libc6-dev,nagios-nrpe-server  
+Maintainer: Information Technology <helpme@photodex.com>
+Description: Installs nrpe and the Nagios plugins.
+ This installs the nrpe service and the Nagios plugins. 
+
+
+

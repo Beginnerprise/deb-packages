@@ -1,0 +1,39 @@
+#! /usr/bin/perl
+
+#  -d <directory of files to check>
+
+@listoffile = `/var/log/backups/*`;
+
+foreach my $file (@listoffile)
+{
+    chomp($file);
+    my @info = stat($file);
+
+    if ($info[9] < $time_we_care_about)
+    {
+	push(@old_files,$file)
+    }
+
+}
+
+# Sorta build an error message
+my $errormsg = undef;
+$errormsg .= "Error: ";
+foreach my $file (@old_files)
+{
+    $errormsg .= "[$file] ";
+}
+$errormsg .= "\n";
+
+
+# See if we got any errors
+if (@old_files > 0)
+{
+    print $errormsg;
+    exit(2);
+}
+else
+{
+    print "All backups current\n";
+    exit(0);
+}

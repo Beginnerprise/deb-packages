@@ -15,8 +15,8 @@ if ($ARGV[0] eq "configure")
   ### Log out idle users after 30 minutes
   system('echo "tmout=1800" >> /etc/profile');
 
-  ### Send all crom mail to internalsupport@srbok.com
-  system('sed -i.backup -e \'s/^root:.*$/root: internalsupport@srbok.com/\' /etc/aliases');
+  ### Send all crom mail to internalsupport@bpok.com
+  system('sed -i.backup -e \'s/^root:.*$/root: internalsupport@bpok.com/\' /etc/aliases');
 
   ### Disable Root Logins
   #system('sed -i.backup -e \'s/^PermitRootLogin yes$/PermitRootLogin no/\' /etc/ssh/sshd_config');
@@ -38,7 +38,7 @@ if ($ARGV[0] eq "configure")
   deb-src http://ftp.us.debian.org/debian/ wheezy-updates main contrib non-free
 
   # Local Package Repository
-  deb http://debian.srb.local/ wheezy main
+  deb http://debian.bp.local/ wheezy main
   EOF
   close(OUT);
 

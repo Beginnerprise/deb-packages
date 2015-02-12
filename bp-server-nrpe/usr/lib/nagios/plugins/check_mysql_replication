@@ -1,0 +1,70 @@
+#!/usr/bin/perl
+
+#######################################################################
+## Nagios plug-in used to check mysql replication.
+##
+## Written by:    Benjamin Hudgens
+## Date written:  September 17, 2013
+## Last modified:
+##
+#######################################################################
+
+#######################################################################
+## Global Variables
+#######################################################################
+
+my $CRITICAL_VALUE = '1000';
+my $WARNING_VALUE  = '500';
+my $SLAVE          = "db2";
+my $MASTER         = "db1";
+my $REPLPASSWD     = "password";
+my $REPLUSERNAME   = "username"; 
+
+#######################################################################
+## Subs
+#######################################################################
+
+sub main {
+
+    &checkReplication();
+    return;
+}
+
+sub checkReplication {
+
+    ### get master data
+    $masterData = `mysql -h $MASTER -u username -p password -e "show master status" | grep bin | cut -f2`;
+    chomp($masterData);
+
+    ### get slave data
+    my $slaveData = `mysql -h $SLAVE -u $REPLUSERNAME -p$REPLPASSWD -e "show slave status" | grep bin | cut -f7`;
+    chomp($slaveData);
+
+    ### compare the data
+    $diff = abs($masterData - $slaveData);
+
+    if ( $diff > $CRITICAL_VALUE ) {
+        print "CRITICAL: the master and slave logs differ by: $diff";
+        exit(2);
+    }
+    elsif ( $diff > $WARNING_VALUE ) {
+        print "WARNING: the master and slave logs differ by: $diff";
+	exit(1);
+    }
+    else {
+        print "OK: Master Log: $masterData - Slave Log: $slaveData - Diff: $diff";
+	exit(0);
+    } 
+
+    return;
+}
+
+#######################################################################
+## Main
+######################################################################
+
+&main();
+exit(0);
+
+
+

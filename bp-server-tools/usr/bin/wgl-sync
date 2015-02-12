@@ -1,0 +1,658 @@
+#! /usr/bin/perl
+#############################################################################################
+## Author: 	Benjamin Hudgens
+## Date:	February 17, 2014
+## Modified:	February 17, 2014
+##
+## Description:	
+##		Sync OMW Environments for WGL
+#############################################################################################
+
+use SRR::Standard;
+use SRR::Mysql;
+
+# Cleanly handle kill signal and shutdowns
+$SIG{'TERM'}	= \&shutdown;
+
+# Default file to save all our settings (generate below)
+my $configDir	= '/etc/wgl'; #Usually /etc/bp
+my $configFile	= "$configDir/" . 'sync.conf'; # Change this to something relevant
+
+# Command line options
+my $opts		= {};  # Always your command line args
+my $config		= {};
+
+# Do not store other script settings in the script - save them to config
+
+# Should we pull from production Mysql?
+my $isUpdateMysqlEnabled 		= undef;
+# Should we update web code from SVN?
+my $isUpdateCodeRepositoryEnabled 	= undef;
+# Should we sync binary files (images/videos)?
+my $isUpdateFileRepositoryEnabled 	= undef;
+# Don't confirm decisions?
+my $isQuietModeEnabled		 	= undef;
+# Purge Customer Data?
+my $isPurgeModeEnabled		 	= undef;
+# Purge Customer binary data
+my $isPurgeFileModeEnabled	 	= undef;
+
+# Default server type - overriden by config
+my $serverType				= 'dev';
+# Where is the web code located?
+my $drupalRoot				= '/var/www/oms.wegolook.com';
+
+# Where do we sync data to - so we can delete it
+my @purgePaths= 
+(
+    '/mnt/links/public',
+    '/mnt/links/private',
+    '/etc/drupal/tmp',
+    '/mnt/links/public/photomanager'
+);
+
+
+sub main
+{
+
+    &initialize();
+
+    my $info = undef;
+
+    $info .= "-----------------Configuration Info-----------------\n";
+    $info .= "Drupal Dir:\t\t\t$drupalRoot\n";
+    $info .= "Server Type:\t\t\t$serverType\n";
+    $info .= "DB Sync Server:\t\t\t$config->{'options'}[0]->{'db_hostname'}[0]\n";
+    $info .= "DB Sync Database:\t\t$config->{'options'}[0]->{'db_database'}[0]\n";
+    $info .= "DB Sync Username:\t\t$config->{'options'}[0]->{'db_username'}[0]\n";
+    #$info .= "DB Sync Password:\t$config->{'options'}[0]->{'db_password'}[0]\n";
+    $info .= "Production Server:\t\t$config->{'options'}[0]->{'production_server'}[0]\n";
+    $info .= "Production File Repository:\t$config->{'options'}[0]->{'production_binary_files_path'}[0]\n";
+    $info .= "----------------------------------------------------\n";
+
+    &say($info);
+
+    # Checkout latest SVN
+    if ($isUpdateCodeRepositoryEnabled)
+    {
+	if (&promptYN("You will need SVN credentials to sync the code base.  Would you like to proceed?  [Y|n]",1))
+	{
+	    &say("Updating Code Repository...");
+	    chdir $drupalRoot;
+	    my $cmd = "svn update";
+	    &debug(9,"C: $cmd");
+	    system($cmd);
+	}
+    }
+
+    # Sync DB
+    if ($isUpdateMysqlEnabled)
+    {
+	if (&promptYN("Syncing the Database may take a while.  Are you ready to proceed? [Y|n]",1))
+	{
+
+	    &say("Updating Mysql Database...");
+	    my $cmd = undef;
+
+	    # Run the SQL import in the background
+	    if (&getChild())
+	    {
+		&say("Running SQL Import in the background... (This will take a while)");
+	    }
+	    else
+	    {
+		# TODO: Server we sync from should be a config
+		$cmd = "mysqldump --opt -h db2.wegolook.com -u wgl123 wegolook > /tmp/sqlimport; mysql wegolook < /tmp/sqlimport";
+		system($cmd);
+
+		&say("SQL Import Completed..");
+
+		# Change Domains Table
+
+		my $dbh = &dbConnect(
+		    'localhost',
+		    $config->{'options'}[0]->{'db_database'}[0],
+		    $config->{'options'}[0]->{'db_username'}[0],
+		    $config->{'options'}[0]->{'db_password'}[0]
+		);
+
+		&say("Updating subdomain settings in database..");
+
+		my $sql = undef;
+
+		# We need to update the domains table so the site works with different domains for staging/dev
+		$sql = "UPDATE domain SET subdomain='oms.$serverType.wegolook.com' WHERE subdomain='oms.wegolook.com'";
+		&debug(9,"S: $sql");
+		&dbUpdate($dbh,$sql);
+		$sql = "UPDATE domain SET subdomain='lookers.$serverType.wegolook.com' WHERE subdomain='lookers.wegolook.com'";
+		&debug(9,"S: $sql");
+		&dbUpdate($dbh,$sql);
+		$sql = "UPDATE domain SET subdomain='orders.$serverType.wegolook.com' WHERE subdomain='orders.wegolook.com'";
+		&debug(9,"S: $sql");
+		&dbUpdate($dbh,$sql);
+		# Exit since we are a child process
+		&shutdown();
+	    }
+	}
+
+    }
+
+    # Sync up the file repository from our production file server(s)
+    if ($isUpdateFileRepositoryEnabled)
+    {
+	if (&promptYN("Syncing File Repository with production server.  Are you sure you want to proceed? [Y|n]",1))
+	{
+	    &say("Updating File Repository...");
+
+	    $cmd = "";
+	    $cmd .= "rsync -ravP --delete ";
+	    $cmd .= "$config->{'options'}[0]->{'production_server'}[0]:$config->{'options'}[0]->{'production_binary_files_path'}[0]/ ";
+	    $cmd .= "$config->{'options'}[0]->{'production_binary_files_path'}[0]/";
+
+	    &debug(9,"C: $cmd");
+	    system($cmd);
+	}
+
+    }
+
+    # Purge production customer data
+    if ($isPurgeModeEnabled)
+    {
+
+
+	# Override any connection and hard code a local connection.  Hopefully this prevents an accidental
+	# Purge of the production database.
+	my $dbh = &dbConnect(
+	    'localhost',
+	    $config->{'options'}[0]->{'db_database'}[0],
+	    $config->{'options'}[0]->{'db_username'}[0],
+	    $config->{'options'}[0]->{'db_password'}[0]
+	);
+
+	my $query = undef;
+	my $results = undef;
+	my $sth = undef;
+	my $node_types = undef;
+	my %lowest_nodetypes_per_nids = ();
+	my %user_accounts_to_orders = ();
+
+	&say("Getting all order statuses and oldest NIDS");
+	$query = "";
+	$query .= " SELECT foid.entity_id AS nid, \n";
+	$query .= "        o.order_id AS oid, \n";
+	$query .= "        o.order_status AS os, \n";
+	$query .= "        o.uid AS uid, \n";
+	$query .= "        l.field_looker_uid AS lid \n";
+	$query .= " FROM uc_orders AS o \n";
+	$query .= " LEFT JOIN uc_order_products AS op ON op.order_id = o.order_id \n";
+	$query .= " LEFT JOIN field_data_field_order_id AS foid ON foid.field_order_id_value = o.order_id \n";
+	$query .= " LEFT JOIN field_data_field_looker AS l ON foid.entity_id = l.entity_id \n";
+	$query .= " GROUP BY o.order_status \n";
+
+	$results = &dbQuery($dbh,$query);
+
+	# Add the NIDS for these orders to our map so we don't purge them
+	foreach my $result (@{$results})
+	{
+	    if ($result->[0] ne "")
+	    {
+		$lowest_nodetypes_per_nids{$result->[0]} = $result->[2];
+		$user_accounts_to_orders{$result->[3]} = $result->[1];
+		$user_accounts_to_orders{$result->[4]} = $result->[1];
+	    }
+	}
+
+	&say("Getting a unique nid for each status type");
+	$query = "";
+	$query .= " SELECT fls.entity_id,ttd.name,uo.uid \n";
+	$query .= " FROM field_data_field_look_status AS fls\n";
+	$query .= " LEFT JOIN taxonomy_term_data AS ttd ON fls.field_look_status_tid=ttd.tid \n";
+	$query .= " LEFT JOIN field_data_field_order_id AS o_id ON o_id.entity_id=fls.entity_id \n";
+	$query .= " LEFT JOIN uc_orders AS uo ON uo.order_id=o_id.field_order_id_value \n";
+	$query .= " GROUP BY fls.field_look_status_tid ";
+
+	$results = &dbQuery($dbh,$query);
+
+	# Add the NIDS for each order status type
+	foreach my $result (@{$results})
+	{
+	    if ($result->[0] ne "")
+	    {
+		$lowest_nodetypes_per_nids{$result->[0]} = $result->[1];
+		$user_accounts_to_orders{$result->[2]} = $result->[1];
+	    }
+	}
+
+	# Get all node types
+	$query = " SELECT type FROM node GROUP BY type ";
+	$node_types = &dbQuery($dbh,$query);
+
+	&say("Getting Lowest Node ID for each node type");
+
+	# Get the oldest value from each node type
+	foreach my $node_type (@{$node_types})
+	{
+	    $query = "";
+	    $query .= " SELECT nid ";
+	    $query .= " FROM node ";
+	    $query .= " WHERE type='$node_type->[0]' ";
+	    $query .= " ORDER BY nid ASC ";
+	    $query .= " LIMIT 1 ";
+
+	    $results = &dbQuery($dbh,$query);
+
+	    if ($results->[0][0] eq "") { next };
+
+	    # Store it both ways for quick access
+	    $lowest_nids_per_nodetype{$node_type->[0]} = $results->[0][0];
+	    $lowest_nodetypes_per_nids{$results->[0][0]} = $node_type->[0];
+
+	}
+
+	&say("Building Node List for each node type");
+	# Format list of lowest nodes for each type for IN query
+	my $sql_in_query = undef;
+	foreach my $nid (keys %lowest_nodetypes_per_nids)
+	{
+	    &debug(19,"nid Map: $nid - [$lowest_nodetypes_per_nids{$nid}]");
+	    $sql_in_query .= "$nid,";
+	}
+	chop($sql_in_query);
+	$sql_in_query = "($sql_in_query)";
+
+	&say("Building User List to Ignore");
+	# Format list of lowest nodes for each type for IN query
+	my $user_in_query = undef;
+	foreach my $uid (keys %user_accounts_to_orders)
+	{
+	    &debug(19,"user Map: $uid - [$user_accounts_to_orders{$uid}]");
+	    $user_in_query .= "$uid,";
+	}
+	chop($user_in_query);
+	$user_in_query = "($user_in_query)";
+
+	# TODO:  BAD BAD BAD!  NO USING GOTO.. you lazy bum
+	#	 but, just this once.. i want to skip the long
+	#	 ass process of purging the db and just purge files
+	#	 .. and it should be broken out that way in code instead of 
+	#	 requiring an edit
+
+	#goto PURGE_FILES_ONLY;
+
+
+	#exit(0);
+
+	# Loop through all the field_data and Field_revision tables and remove anything not in the lowest NID tables
+	$query = "";
+	$query = "SHOW TABLES";
+
+	$tables = $dbh->selectall_arrayref($query);
+
+	&say("Purging field tables for all data aside from lowest node id");
+	foreach my $table (@{$tables})
+	{
+
+	    if ($table->[0] =~ /^field_data_field_/ || $table->[0] =~ /^field_revision_field_/)
+	    {
+		my $query	= undef;
+
+		&say("Purging records in table [$table->[0]]");
+
+		$query = "";
+		$query .= " DELETE FROM $table->[0] ";
+		$query .= " WHERE entity_id NOT IN  $sql_in_query ";
+
+		$results = &dbUpdate($dbh,$query);
+	    }
+	}
+
+	&say("Purging All Caches");
+	foreach my $table (@{$tables})
+	{
+
+	    if ($table->[0] =~ /^cache_/)
+	    {
+		my $query	= undef;
+
+		&say("Purging records in table [$table->[0]]");
+
+		$query = "";
+		$query .= " DELETE FROM $table->[0] ";
+
+		$results = &dbUpdate($dbh,$query);
+	    }
+	}
+
+	# Now purge all the nodes not in our list
+	$query = "";
+	$query .= " DELETE ";
+	$query .= " FROM node ";
+	$query .= " WHERE nid NOT IN $sql_in_query ";
+	$query .= " AND type!='look' ";
+
+	&debug(1,"S: $query");
+	&dbUpdate($dbh,$query);
+
+	# Remove all lookers and Their Form Data
+	# Remove all customer users and their form data
+	$query = "";
+	$query .= " DELETE looker_documents FROM users \n";
+	$query .= " LEFT JOIN (users_roles) ON (users.uid = users_roles.uid) \n";
+	$query .= " LEFT JOIN (looker_documents) ON (users.uid = looker_documents.uid) \n";
+	$query .= " WHERE users_roles.rid IN (4,8) \n";
+
+	&debug(1,"S: $query");
+	&dbUpdate($dbh,$query);
+
+	# Purge all users that are not CSR's, Admins, and/or customers in which we are keeping records
+	&say("Purging customer data...");
+
+	$query = "";
+	$query .= " DELETE u.* \n";
+	$query .= " FROM users AS u \n";
+	$query .= " LEFT JOIN users_roles AS ur ON u.uid=ur.uid \n";
+	$query .= " LEFT JOIN role AS r ON ur.rid=r.rid \n";
+	$query .= " WHERE (r.name='Client' \n";
+	$query .= " OR r.name IS NULL \n";
+	$query .= " OR r.name='Affiliate' \n";
+	$query .= " OR r.name='Looker') \n";
+	$query .= " AND u.uid NOT IN $user_in_query \n";
+
+	&debug(1,"S: $query");
+	&dbUpdate($dbh,$query);
+
+	&say("Deleteing all orders exluding the one from each status type..");
+
+	# Delete all the order information aside from one from each type
+
+	# NOTE:  We get all orders but exclude from the list above which we derive from each node type
+	#        and each order type.  We have to get the nid from the field_data_field_order_id table
+	#        because the noid of the actual order is stored with the look that's created on checkout.
+	#        The NOID stored in uber cart is for the order 'type'.  The actual look is built in a custom
+	#        module (wgl_uc)
+	$query = "";
+	$query .= " DELETE o.*, op.*, ol.* \n";
+	$query .= " FROM uc_orders AS o \n";
+	$query .= " LEFT JOIN uc_order_products AS op ON o.order_id=op.order_id \n";
+	$query .= " LEFT JOIN uc_order_log AS ol ON o.order_id=ol.order_id \n";
+	$query .= " LEFT JOIN field_data_field_order_id AS foid ON foid.field_order_id_value = o.order_id \n";
+	$query .= " WHERE foid.entity_id NOT IN $sql_in_query ";
+
+
+	&debug(1,"S: $query");
+	&dbUpdate($dbh,$query);
+
+	# Purge files not related to data found above
+
+	# Loop through the paths specified as a config (global var)
+	# Get all the files
+	# if the file contains a nid we are going to keep.. skip it
+PURGE_FILES_ONLY:
+
+
+	if ($isPurgeFileModeEnabled)
+	{
+	    &say("Purging Files - This can take a long time..");
+	    foreach my $path (@purgePaths)
+	    {
+		&debug(15,"Purging Path [$path]");
+
+		&say("Checking Directory for Customer Data [$path]");
+
+		if (-d $path)
+		{
+		    chdir $path;
+
+		    @files = `find ./ -type f`;
+
+		    foreach my $file (@files)
+		    {
+			chomp($file);
+			my $found = undef;
+			foreach my $nid (keys %lowest_nodetypes_per_nids)
+			{
+			    if ($file =~ /$nid/)
+			    {
+				$found = 1;
+				last;
+			    }
+			}
+			if (!$found)
+			{
+			    my $cmd = "rm $file";
+			    system($cmd);
+			    &debug(19,"Purging File [$file]");
+			}
+			else
+			{
+			    &say("Skipping File [$file]");
+			}
+		    }
+		}
+	    }
+	}
+
+    }
+
+
+}
+
+sub promptYN ()
+{
+    my $msg = shift;
+    my $dflt = shift;
+
+    if ($isQuietModeEnabled)
+    {
+	return 1;
+    }
+
+    if ($msg ne "")
+    {
+	print $msg;
+    }
+
+    $input = <STDIN>;
+
+    chomp($input);
+
+    if ($input eq "")
+    {
+	return ($dflt);
+    }
+
+    if ($input =~ /y/)
+    {
+	return(1);
+    }
+    else
+    {
+	return undef;
+    }
+}
+
+sub usage
+{
+    &say ("							");
+    &say ("WeGoLook, LLC Dev Environment Sync Tool 		");
+    &say ("Copyright (C) 2008-2014				");
+    &say ("-------------------------------------------------	");
+    &say ("							");
+    &say ("Usage:						");
+    &say ("$0 -m -s -f [-aphqgx] [-d debug] [-t type]		");
+    &say ("							");
+    &say (" -a Sync All 					");
+    &say (" -d Set Debug Level 					");
+    &say (" -g Generate Sample Configurateion 			");
+    &say (" -m Update Mysql					");
+    &say (" -p Purge Customer Data From DB			");
+    &say (" -q Quiet Mode - No Prompts				");
+    &say (" -f Update File Repository				");
+    &say (" -s Update Code Repository From Source		");
+    &say (" -t Server Type [dev|staging]			");
+    &say (" -x Purge Binary Files also  			");
+    &say ("							");
+}
+
+sub generateConfig
+{
+
+    say("Generating Configuration Files [$configFile]...");
+
+    if (-f $configFile) 
+    {
+	&sError("Config File Exists - Not overwriting: $configFile");
+	return(undef);
+    }
+
+    # Create a sample data structure here
+    # which will make configuring various scripts really easy later
+
+    my $config					= {};
+
+    $config->{'options'}->{'server_type'}			= 'dev';
+    $config->{'options'}->{'drupal_root'}			= '/var/www/oms.wegolook.com';
+    $config->{'options'}->{'production_server'}			= 'oms.wegolook.com';
+    $config->{'options'}->{'production_binary_files_path'}	= '/mnt/links';
+    $config->{'options'}->{'db_hostname'}			= 'localhost';
+    $config->{'options'}->{'db_database'}			= 'wegolook';
+    $config->{'options'}->{'db_username'}			= 'wgl123';
+    $config->{'options'}->{'db_password'}			= 'changeme';
+
+    if (!-d $configDir)
+    {
+	`mkdir -p $configDir`;
+	if (!-d $configDir) { &hError("Failed to create dir: [$configDir]") };
+    }
+
+    &saveConfig($configFile,$config);
+
+    `chmod 600 $configFile`;
+
+}
+
+sub shutdown
+{
+    # We get called even if we are sent a kill()
+    # Make sure to clean up 'anything' we are doing
+    # We can get called at any time
+    # Keep track of open files and various other things so they can get cleaned up 
+
+    exit(0);
+}
+
+sub initialize
+{
+    # Some standard opts 
+    # -d debug level
+    # -g generate a config file
+    # -h help summary
+    # -c config file (default: /etc/bp/<myname>)
+
+    $opts = &getCommandLineOptions('hd:gaqfmpsc:t:x'); # colon means takes argument / just letter is Boolean
+
+    if (!$opts)   # We had an error
+    {
+	&usage();
+	exit(0);
+    }
+
+    if ($opts->{'h'})
+    {
+	&usage();
+	&shutdown();
+    }
+
+    if ($opts->{'d'})
+    {
+	&setDebugLevel($opts->{'d'});
+	&debug(1,"Debug Level Set: $opts->{'d'}");
+    }
+
+    if ($opts->{'c'})
+    {
+	$configFile	= $opts->{'c'};
+    }
+
+    if ($opts->{'g'})
+    {
+	&generateConfig();
+	&shutdown();
+    }
+
+    if (-f $configFile)
+    {
+	$config	= &readConfig($configFile);
+    }
+    else
+    {
+	&hError("Couldn't find config file $configFile");
+    }
+
+    if ($opts->{'a'})
+    {
+	$isUpdateMysqlEnabled 		= 1;
+	$isUpdateFileRepositoryEnabled 	= 1;
+	$isUpdateCodeRepositoryEnabled 	= 1;
+    }
+
+    if ($opts->{'m'})
+    {
+	&debug(2,"Update Mysql DB  Enabled");
+	$isUpdateMysqlEnabled 		= 1;
+    }
+
+    if ($opts->{'p'})
+    {
+	&debug(2,"Purge Mode Enabled");
+	$isPurgeModeEnabled 		= 1;
+    }
+
+    if ($opts->{'x'})
+    {
+	&debug(2,"Purge Mode Enabled");
+	$isPurgeFileModeEnabled		= 1;
+    }
+
+    if ($opts->{'q'})
+    {
+	&debug(2,"Quiet Mode Enabled");
+	$isQuietModeEnabled 		= 1;
+    }
+
+    if ($opts->{'s'})
+    {
+	&debug(2,"Update Code Repository Enabled");
+	$isUpdateCodeRepositoryEnabled 	= 1;
+    }
+
+    if ($opts->{'f'})
+    {
+	&debug(2,"Update File Repository Enabled");
+	$isUpdateFileRepositoryEnabled 	= 1;
+    }
+
+    # Change Defaults
+    if ($opts->{'t'})
+    {
+	$serverType	= $opts->{'t'};
+    }
+    else
+    {
+	$serverType 	= $config->{'options'}[0]->{'server_type'}[0]
+    }
+
+    if ($serverType ne "dev" && $serverType ne "staging")
+    {
+	&hError("Invalid Server Type:  $serverType - Must be [staging] or [dev]");
+    }
+
+    if ($config->{'options'}[0]->{'db_password'}[0] eq "changeme")
+    {
+	&hError("Config [$configFile] still contains default DB Password");
+    }
+
+}
+
+&main();
+exit(0);

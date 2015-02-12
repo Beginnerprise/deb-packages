@@ -1,0 +1,64 @@
+#! /usr/bin/perl
+######################################################################
+# Script to take random screen shots
+######################################################################
+
+
+######################################################################
+# Configuration Variables
+######################################################################
+my $screenshotDir = '/Users/benjamin/Google Drive/screenshots';
+my $numberOfScreens = 4;
+my $numberOfSeconds = 10;
+
+
+######################################################################
+# Main Program - Do Not Edit
+######################################################################
+sub main 
+{
+#    while(1)
+#    {
+	&takeScreenshot();
+#	sleep($numberOfSeconds);
+#    }
+}
+
+sub takeScreenshot
+{
+
+    chdir($screenshotDir);
+
+    @time = localtime();
+
+    $time[5] += 1900;
+    $time[4] = $time[4] + 1;
+
+    my $datestamp = "$time[5]$time[4]$time[3]-$time[2]$time[1]$time[0]";
+
+    for ($c = 0; $c < $numberOfScreens; $c++)
+    {
+	push(@files, "$datestamp-screen$c.png");
+    }
+
+
+    my $cmd = "screencapture -x";
+
+    ## deal with bootstrap hierarchy
+    # http://superuser.com/questions/26956/use-cron-to-screen-capture-on-mac-os-x
+    $loginwindowpid = `ps axo pid,comm | grep '[l]oginwindow'`;
+    chomp($loginwindowpid);
+    $loginwindowpid =~ s/\s*(\d+)\s*.*/$1/;
+    #$cmd = "sudo launchctl bsexec $loginwindowpid " . $cmd;
+
+    foreach my $file (@files)
+    {
+	$cmd .= " ./$file ";
+    }
+
+    system($cmd);
+    print "Screenshot taken [$datestamp]\n";
+}
+
+&main();
+exit(0);

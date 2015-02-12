@@ -1,0 +1,22 @@
+#! /bin/bash
+
+PROGNAME=`basename $0`
+PROGPATH=`echo $0 | sed -e 's,[\\/][^\\/][^\\/]*$,,'`
+
+. $PROGPATH/utils.sh
+
+if [ "$1" = "" ]
+then
+	echo -e " Use : $PROGNAME <file_name> -- Ex : $PROGNAME /etc/hosts \n "
+	exit $STATE_UNKNOWN
+fi
+
+
+if [ -f $1 ]
+then
+	echo "Offsite backups WARNING - backups are not enabled"
+	exit $STATE_WARNING
+else
+	echo "Offsite backups OK - backups are enabled"
+	exit $STATE_OK
+fi

@@ -1,0 +1,2 @@
+* * * * *	root	/usr/bin/bp-ad-asterisk-sync -p -f
+0 0 * * *	root	/usr/bin/bp-ad-asterisk-sync -v -V

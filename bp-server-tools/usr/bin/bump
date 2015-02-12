@@ -1,0 +1,17 @@
+#! /usr/bin/perl
+
+#####################################################################################################
+# Author:	Benjamin Hudgens
+# Date:		September 16, 2013
+#
+# Description:
+#		Very quick script to bump a package version
+#####################################################################################################
+
+my $controlFile	= './DEBIAN/control';
+
+if (-f $controlFile)
+{
+    `echo >> $controlFile`;
+    exec("svn commit -m 'bump' $controlFile");
+}

@@ -1,0 +1,61 @@
+#! /usr/bin/perl
+
+my $bad = undef;
+my $bad_shares = undef;
+
+for ($c = 0; $c < 100; $c++)
+{
+    my $num = sprintf("%02s",$c);
+    my $dir = "/mnt/links/$num";
+    my $tst = "$dir/test" . int(rand(10000));
+
+    open(OUT,"> $tst");
+    print OUT "iseeyou\n";
+    close(OUT);
+
+    if (-f $tst)
+    {
+	open(IN,"< $tst");
+	my @lines = <IN>;
+	close(IN);
+
+	my $worked = undef;
+
+	foreach my $line (@lines)
+	{
+	    chomp($line);
+
+	    if ($line eq "iseeyou")
+	    {
+		#print "Dir [$num] is working\n";
+		$worked=1;
+	    }
+	}
+
+	if (!$worked)
+	{
+	    $bad = 1;
+	    $bad_shares .= " $num ";
+	}
+
+	unlink($tst);
+    }
+    else
+    {
+	$bad = 1;
+	$bad_shares .= " $num ";
+    }
+
+}
+
+if ($bad)
+{
+	print "ERROR: Dir(s) $bad_shares FAILED!!!\n";
+	exit(2);
+}
+else
+{
+	print "OK - All shares working fine\n";
+	exit(0);
+}
+

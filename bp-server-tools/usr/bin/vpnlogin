@@ -1,0 +1,266 @@
+#! /usr/bin/perl
+
+use LWP::UserAgent;
+use JSON;
+use Data::Dumper;
+use Term::ReadKey;
+
+
+######################################################################
+# Configuration Options
+######################################################################
+my $vpn_key_file = '/tmp/vpn.key';
+my $vpn_p_file = '/tmp/vpn.p';
+my $path_openvpn_binary = '/Applications/Tunnelblick.app/Contents/Resources/openvpn/openvpn-2.2.1/openvpn';
+my $path_config_dir = '/tmp';
+my $openvpn_config = 'config.ovpn';
+my $kext_file = '/Applications/Tunnelblick.app/Contents/Resources/tun-signed.kext';
+my $vpn_url = 'https://vpn.beginnerprise.com/cgi-bin/vpn.cgi';
+my $tunnelblick_command_options = '-m -w -d -f -ptADGNWradsgnw';
+my $tunnelblick_up_command = "/Applications/Tunnelblick.app/Contents/Resources/client.up.tunnelblick.sh $tunnelblick_command_options";
+my $tunnelblick_down_command = "/Applications/Tunnelblick.app/Contents/Resources/client.down.tunnelblick.sh $tunnelblick_command_options";
+my $credentials	= {};
+
+
+
+sub main
+{
+
+    # Need to run as root
+
+    my $whoami = `whoami`;
+    chomp($whoami);
+
+    if ($whoami ne "root")
+    {
+	system("sudo $0");
+	exit(0);
+    }
+
+    my $parms = {};
+
+    $parms->{'responsetype'} = 'json';
+
+    &initialize();
+
+    if (!-f $vpn_key_file || !-f $vpn_p_file)
+    {
+	&getCredentials();
+
+	$parms->{'command'} = 'getkey';
+	$parms->{'username'} = $credentials->{'username'};
+	$parms->{'password'} = $credentials->{'password'};
+
+	my $response = &vpnRequest($parms);
+
+	if ($response->{'response'}->{'code'} == 200)
+	{
+	    open(OUT,">$vpn_key_file");
+	    print OUT $response->{'response'}->{'key'};
+	    close(OUT);
+	    #`echo '$response->{'response'}->{'key'}' > $vpn_key_file`;
+	    $credentials->{'key'} = $response->{'response'}->{'key'};
+	    open(OUT,">$vpn_p_file");
+	    print OUT $response->{'response'}->{'pm4'};
+	    close(OUT);
+	    $credentials->{'password'} = $response->{'response'}->{'pm4'};
+	    $credentials->{'password'} =~ s/.*\|\|(.*)\|\|.*/$1/;
+	    print "Authentication Successful\n";
+	}
+	else
+	{
+	    &error(8383,"Login Failed");
+	}
+    }
+    else
+    {
+	open(IN,"<$vpn_key_file");
+	$credentials->{'key'} = <IN>;
+	close(IN);
+	chomp($credentials->{'key'});
+	print "The Key Detected for usage:  $credentials->{'key'}\n";
+
+	open(IN,"<$vpn_p_file");
+	$credentials->{'password'} = <IN>;
+	close(IN);
+	chomp($credentials->{'key'});
+	$credentials->{'password'} =~ s/.*\|\|(.*)\|\|.*/$1/;
+
+	$parms->{'command'} = 'auth';
+	$parms->{'key'} = $credentials->{'key'};
+	$parms->{'password'} = $credentials->{'password'};
+
+	my $response = &vpnRequest($parms);
+
+	if ($response->{'response'}->{'code'} == 200)
+	{
+	    print "Authentication Successful\n";
+	}
+	else
+	{
+	    #unlink($vpn_key_file);
+	    &error(8383,"Login Failed");
+	}
+    }
+
+    my $ua = LWP::UserAgent->new();
+    my $response = undef;
+    my $results = undef;
+    $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+
+    $parms->{'command'} = 'vpnconfig';
+    $parms->{'key'} = $credentials->{'key'};
+    $parms->{'password'} = $credentials->{'password'};
+    $response = $ua->post($vpn_url, $parms);
+    open(OUT, "> $path_config_dir/$openvpn_config");
+    print OUT $response->decoded_content();
+    close(OUT);
+    print "Downloading VPN Config\n";
+
+    $parms->{'command'} = 'fileusercert';
+    $parms->{'key'} = $credentials->{'key'};
+    $parms->{'password'} = $credentials->{'password'};
+    $response = $ua->post($vpn_url, $parms);
+    open(OUT, "> $path_config_dir/bp.crt");
+    print OUT $response->decoded_content();
+    close(OUT);
+    print "Downloading User Certificate\n";
+
+    $parms->{'command'} = 'fileuserkey';
+    $parms->{'key'} = $credentials->{'key'};
+    $parms->{'password'} = $credentials->{'password'};
+    $response = $ua->post($vpn_url, $parms);
+    open(OUT, "> $path_config_dir/bp.key");
+    print OUT $response->decoded_content();
+    close(OUT);
+    print "Downloading User Key\n";
+
+    $parms->{'command'} = 'fileservercert';
+    $parms->{'key'} = $credentials->{'key'};
+    $parms->{'password'} = $credentials->{'password'};
+    $response = $ua->post($vpn_url, $parms);
+    open(OUT, "> $path_config_dir/ca.crt");
+    print OUT $response->decoded_content();
+    close(OUT);
+    print "Downloading Server Certificate\n";
+
+    &runCommand("kextload $kext_file");
+    my @openvpn_options = (
+#    "--daemon",
+#    "--log",
+	"--cd '$path_config_dir'",
+	"--config '$path_config_dir/$openvpn_config'",
+#    "--management 127.0.0.1 1337",
+#    "--management-query-passwords",
+#    "--management-hold",
+	"--script-security 2",
+	"--up '$tunnelblick_up_command'",
+	"--down '$tunnelblick_down_command'"
+    );
+
+    my $cmd = undef;
+
+    $cmd .= " $path_openvpn_binary ";
+    foreach my $option (@openvpn_options)
+    {
+	$cmd .= " $option ";
+    }
+
+    &runCommand($cmd);
+}
+
+sub initialize
+{
+    if (!-d $path_config_dir)
+    {
+	&runCommand("mkdir $path_config_dir");
+	if (!-d $path_config_dir)
+	{
+	    &error(2342,"Couldn't create config dir [$path_config_dir]");
+	}
+    }
+
+    if (!-f $path_openvpn_binary)
+    {
+	&error("Cannot Locate OpenVPN Binary [$path_openvpn_binary]");
+    }
+}
+
+sub runCommand
+{
+    my $cmd = shift;
+    print "C:$cmd\n";
+    system($cmd);
+}
+
+sub shutdown
+{
+    my $lvl = shift;
+
+    if (!$lvl || $lvl !~ /\d+/)
+    {
+	$lvl = 0;
+    }
+
+    exit($lvl);
+}
+
+sub error
+{
+    my $code = shift;
+    my $error = shift;
+
+    print STDERR "\n\nERROR [$code]: $error\n";
+    &shutdown();
+}
+
+sub vpnRequest
+{
+    $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+    my $parms = shift;
+    my $ua = LWP::UserAgent->new();
+    my $response = $ua->post($vpn_url, $parms);
+    #my $response = $ua->post($vpn_url, [ 'responsetype' => 'json', 'option2' => 'value2' ]);
+    my $results = $response->decoded_content();
+    #my $results = $response->as_string();
+    return decode_json($results);
+}
+
+sub getCredentials
+{
+    print "Please enter your Username:  ";
+    $credentials->{'username'} = <STDIN>;
+    chomp($credentials->{'username'});
+
+    &getPassword();
+}
+
+sub getPassword
+{
+    print "Please enter your Password:  ";
+    ReadMode 'noecho';
+    $credentials->{'password'} = <STDIN>;
+    chomp($credentials->{'password'});
+    ReadMode 'normal';
+    print "\n";
+}
+
+&main();
+&shutdown();
+
+#   /Applications/Tunnelblick.app/Contents/Resources/openvpn/openvpn-2.2.1/openvpn
+#          --daemon
+#          --log /Library/Application Support/Tunnelblick/Logs/-SUsers-Sbenjamin-SLibrary-SApplication Support-STunnelblick-SConfigurations-S05--21--2014.tblk-SContents-SResources-Sconfig.ovpn.1_0_1_0_16689.1337.openvpn.log
+#          --cd /Library/Application Support/Tunnelblick/Users/benjamin/05-21-2014.tblk/Contents/Resources
+#          --config /Library/Application Support/Tunnelblick/Users/benjamin/05-21-2014.tblk/Contents/Resources/config.ovpn
+#          --cd /Library/Application Support/Tunnelblick/Users/benjamin/05-21-2014.tblk/Contents/Resources
+#          --management 127.0.0.1 1337
+#	  --management-query-passwords
+#          --management-hold
+#          --script-security
+#          2
+#          --up
+#          /Applications/Tunnelblick.app/Contents/Resources/client.up.tunnelblick.sh -m -w -d -f -ptADGNWradsgnw
+#          --down
+#          /Applications/Tunnelblick.app/Contents/Resources/client.down.tunnelblick.sh -m -w -d -f -ptADGNWradsgnw
+#

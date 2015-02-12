@@ -1,0 +1,503 @@
+#! /usr/bin/perl
+
+#######################################################################
+##
+## Author: Benjamin Hudgens
+## Date:   November 21, 2006
+##
+## Description
+##
+## This script will generate an OpenVPN Certificate, create the
+## OpenVPN configuration files for the client, package the client
+## into a self extracting Windows ZIP file, and email the contents
+## to the user.  The installation package will self install on the
+## clients machine copying the config and keys to the appropriate
+## place on the clients machine making the VPN installation very
+## seemless
+##
+## If the key already exists for a user we will simply grab the key
+## repackage the zip and send the installation to the user.
+##
+#######################################################################
+
+use Photodex::Standard;
+use Getopt::Std;
+
+#######################################################################
+## Static Variable Assignment
+#######################################################################
+
+## Set up to 10 for loud debug info
+my $debug		= undef;
+$debug=10;
+
+## Turn off to simply create the archive
+my $emailArchives	= undef;
+
+
+my $ZIPCOMMAND		= `which 7z`;
+my $OPENSSLCOMMAND	= `which openssl`;
+my $OPENVPNDIRECTORY	= '/etc/openvpn/';
+my $KEYDIRECTORY	= '/etc/openvpn/easy-rsa/keys/';
+my $SERVERCRT		= '/etc/openvpn/easy-rsa/keys/ca.crt';
+my $TEMPLATEDIRECTORY	= '/etc/openvpn/template';
+my $EXESTUBB		= '/etc/openvpn/7zS.sfx';
+my $ZIPCONF		= '/etc/openvpn/7zip.conf';
+my $VPNSERVER		= 'vpn.beginnerprise.com';
+my $VPNPROTO		= 'tcp';
+my $VPNPORT		= 80;
+my $DAYSTOEXPIRE	= 1;
+
+chomp($ZIPCOMMAND);
+chomp($OPENSSLCOMMAND);
+
+#######################################################################
+## Subroutines
+#######################################################################
+
+sub main {
+
+    my $username	= undef;
+    my $chk		= undef;
+    my $archiveFile	= undef;
+    my $keyFile		= undef;
+    my $crtFile		= undef;
+
+    &setDebugLevel($debug);
+
+    &initialize;
+
+    $username  		= &verifyUser();
+
+    $chk = $KEYDIRECTORY . "$username.key";
+
+    #if (!-f $chk) {
+    if (1) {
+
+        my $configFile		= undef;
+        my $csrFile		= undef;
+
+        $configFile 		= &createSSLConfig($username);
+        ($keyFile,$csrFile)	= &createKeyFile($username,$configFile);
+        $crtFile		= &signKeyFile($username,$csrFile,$configFile);
+
+        $crtFile = $KEYDIRECTORY . "$crtFile";
+        $keyFile = $KEYDIRECTORY . "$keyFile";
+
+        &debug(10,"Removing $configFile");
+        unlink($configFile);
+
+    } else {
+
+        $crtFile = $KEYDIRECTORY . "$username.crt";
+        $keyFile = $KEYDIRECTORY . "$username.key";
+
+	if (!-f $crtFile) { &hError("Keyfile exists but no CRT file: $crtFile") };
+
+    }
+
+    debug(10,"CRTFILE: $crtFile");
+    debug(10,"KEYFILE: $keyFile");
+
+    # Reset parms on keys folder for Web user
+
+    $cmd = "chmod 770 /etc/openvpn/easy-rsa/keys";
+    system($cmd);
+
+#    $archiveFile	= &createArchive($username,$crtFile,$keyFile);
+#
+#    if (!$emailArchives) {
+#        say("Created $archiveFile");
+#    } else {
+#
+#	my $ret  = undef;
+#
+#        $ret = &emailArchive($username,$archiveFile);
+#	say("Emailed $archiveFile to $ret");
+#	debug(9,"Removing $archiveFile");
+#	unlink($archiveFile);
+#    }
+
+}
+
+sub initialize {
+
+    if (!-f $ZIPCOMMAND)     { &hError("Couldn't find 7z command")                     };
+    if (!-f $OPENSSLCOMMAND) { &hError("Couldn't find openssl command")                };
+    #if (!-f $ZIPCONF)        { &hError("Couldn't find zip config: $ZIPCONF")           };
+    #if (!-f $EXESTUBB)       { &hError("Couldn't find exe stubb: $EXESTUBB")           };
+    if (!-f $SERVERCRT)      { &hError("Couldn't find server crt: $SERVERCRT")         };
+
+}
+
+sub emailArchive {
+
+    use MIME::Entity;
+
+    my $un		= shift;
+    my $af		= shift;
+    my $e		= undef;
+    my $msg		= undef;
+    my $sendmailCommand = undef;
+    my $sendToAddress	= undef;
+
+    $sendmailCommand  	= `which sendmail`;
+    chomp($sendmailCommand);
+
+    if (!-f $sendmailCommand) {
+
+        &error("Couldn't find sendmail command");
+
+    }
+
+    open(MAIL,"| $sendmailCommand -t -oi -oem");
+
+    $sendToAddress 	= $un . '@bpok.com';
+
+    ##FIXME  Probably should make a template file instead of making this message dependant on code changes
+
+    $msg		= "";
+    $msg		= $msg . "Hello --\n";
+    $msg		= $msg . "\n";
+    $msg		= $msg . "Please run the attached executable to configure your VPN connection.\n";
+    $msg		= $msg . "\n";
+    $msg		= $msg . "Please reply to this email if you have difficulty setting up your VPN.\n";
+    $msg		= $msg . "\n";
+    $msg		= $msg . "Sincerely,\n";
+    $msg		= $msg . "Your friendly IT Department\n";
+
+    $e 			= MIME::Entity->build(From	=> 'helpme@bpok.com',
+    					      To	=> $sendToAddress,
+					      Subject	=> 'VPN Setup and Installation',
+					      Data	=> $msg
+					     );
+
+    $e->attach(	Path	=> $af,
+    		Type	=> 'application/x-msdownload'
+	      );
+
+    $e->print(\*MAIL);
+
+    return($sendToAddress);
+
+}
+
+sub createArchive {
+
+    my $un		= shift;
+    my $cf		= shift;
+    my $kf		= shift;
+
+    &debug(1,"Sub createArchive...");
+
+    my $cmd		= undef;
+    my $tmpDir		= undef;
+    my $kfDir		= undef;
+    my $confFile	= undef;
+    my $exe		= undef;
+
+    $tempDir 		= $OPENVPNDIRECTORY . "$un.template";
+
+    $cmd 		= "cp -r $TEMPLATEDIRECTORY $tempDir";
+
+    debug(10,"Running: $cmd");
+    system($cmd);
+
+    $kfDir		= "$tempDir/keyfiles";
+
+    if (!-d $kfDir) { &hError("Couldn't find Keyfile Dir: $kfDir") };
+
+    $exe		= "$OPENVPNDIRECTORY" . "$un.exe";
+
+    #$confFile		= &createClientConfig($un,$kfDir);
+
+    debug(5,"Copying Keyfiles to Template");
+
+    $cmd		= "cp $cf $kfDir/bp.crt";
+    system($cmd);
+    debug(10,"Running: $cmd");
+
+    $cmd		= "cp $kf $kfDir/bp.key";
+    system($cmd);
+    debug(10,"Running: $cmd");
+
+    $cmd		= "cp $SERVERCRT $kfDir";
+    system($cmd);
+    debug(10,"Running: $cmd");
+
+    chdir($tempDir);
+    $cmd		= "$ZIPCOMMAND a -y ../$un.7z * 2> /dev/null 1> /dev/null";
+    system($cmd);
+    debug(10,"Running: $cmd");
+
+    chdir($OPENVPNDIRECTORY);
+    $cmd		= "cat $EXESTUBB $ZIPCONF $un.7z > $exe";
+    system($cmd);
+    debug(10,"Running: $cmd");
+
+    if (!-f $exe) { &hError("Didn't create EXE file: $exe") };
+
+    debug(5,"Removing $un.7z");
+    unlink("$un.7z");
+    debug(5,"Removing $tempDir");
+    `rm -r -f $tempDir`;
+
+
+
+    return($exe);
+
+}
+
+sub createClientConfig {
+
+    my $un	= shift;
+    my $kd	= shift;
+
+    debug(1,"Sub createClientConfig...");
+
+    my $vpnConf = undef;
+
+    $vpnConf = "$kd/Photodex.ovpn";
+
+    debug(5,"Creating Client Config: $vpnConf");
+
+    open(OUT,">$vpnConf");
+
+    print OUT "client\r\n";
+    print OUT "dev tun\r\n";
+    print OUT "proto $VPNPROTO\r\n";
+    print OUT "remote $VPNSERVER $VPNPORT\r\n";
+    print OUT "resolv-retry infinite\r\n";
+    print OUT "nobind\r\n";
+    print OUT "persist-key\r\n";
+    print OUT "persist-tun\r\n";
+    print OUT "ca C:\\\\Program\\ Files\\\\OpenVPN\\\\config\\\\ca.crt\r\n";
+    print OUT "cert C:\\\\Program\\ Files\\\\OpenVPN\\\\config\\\\bp.crt\r\n";
+    print OUT "key C:\\\\Program\\ Files\\\\OpenVPN\\\\config\\\\bp.key\r\n";
+    print OUT "comp-lzo\r\n";
+    print OUT "verb 3\r\n";
+
+    close(OUT);
+
+    if (!-f $vpnConf) { &hError("Failed to create Client Config: $vpnConf") };
+
+    return();
+
+}
+
+sub signKeyFile {
+
+    my $un		= shift;
+    my $cf		= shift;
+    my $conf		= shift;
+
+    debug(1,"Sub signKeyFile...");
+
+    my $crt		= undef;
+
+    if (!-f $cf) { &hError("CSR File Not Found: $cf") };
+
+    $crt		= "$un.crt";
+
+    chdir($KEYDIRECTORY);
+
+    if ($debug) {
+        $args = "ca -days $DAYSTOEXPIRE -batch -out $crt -in $cf -config $conf";
+    } else {
+        $args = "ca -days $DAYSTOEXPIRE -batch -out $crt -in $cf -config $conf &> /dev/null";
+    }
+
+    $cmd = "$OPENSSLCOMMAND $args";
+
+    &debug(10,"Running: $cmd");
+
+    system($cmd);
+
+    if (!-f $crt) { &hError("Creating CRTfile failed: $crt") };
+
+    return($crt);
+
+}
+
+sub createKeyFile {
+
+    my $un		= shift;
+    my $conf		= shift;
+
+    debug(1,"Sub createKeyFile...");
+
+    my $cmd		= undef;
+    my $args		= undef;
+    my $kf		= undef;
+    my $cf		= undef;
+
+    $kf 		= "$un.key";
+    $cf 		= "$un.csr";
+
+    chdir($KEYDIRECTORY);
+
+    if ($debug) {
+        $args = "req -days $DAYSTOEXPIRE -nodes -new -keyout $kf -out $cf -config $conf";
+    } else {
+        $args = "req -days $DAYSTOEXPIRE -nodes -new -keyout $kf -out $cf -config $conf &> /dev/null";
+    }
+
+    $cmd = "$OPENSSLCOMMAND $args";
+
+    &debug(10,"Running: $cmd");
+
+    system($cmd);
+
+    if (!-f $kf) { &hError("Creating Keyfile failed: $kf") };
+    if (!-f $cf) { &hError("Creating CSRFile failed: $cf") };
+
+    return($kf,$cf);
+
+}
+
+sub verifyUser {
+
+    my $return 		= undef;
+    my $chk 		= undef;
+    my $verify 		= undef;
+
+    debug(1,"Sub verifyUser...");
+
+    $chk = @ARGV;
+
+    if ($chk < 1) {
+        &usage();
+	&hError("No Username Specified");
+    }
+
+
+    $return = $ARGV[0];
+
+    debug(5,"Found user: $return");
+
+    return($return);
+
+}
+
+sub usage {
+
+    print STDERR "#############################################\n";
+    print STDERR "                                             \n";
+    print STDERR "Usage:                                       \n";
+    print STDERR "   $0 -f -s <subnet>                         \n";
+    print STDERR "   $0 -u [-e <email address>                 \n";
+    print STDERR "                                             \n";
+    print STDERR " Firewall Settings:                          \n";
+    print STDERR "   -f enable firewall configuration          \n";
+    print STDERR "   -s subnet assigned to firewall            \n";
+    print STDERR "                                             \n";
+    print STDERR " User Settings:                              \n";
+    print STDERR "   -u -e <email address>                     \n";
+    print STDERR "   -e email address of the user (optional)   \n";
+    print STDERR "                                             \n";
+    print STDERR "#############################################\n";
+
+}
+
+#######################################################################
+## The following will generate the openssl configuration file specific
+## to the user we are about to create a vpn certificate for
+##
+## Note the format is a bit ugly due to the massive PRINT OUT
+#######################################################################
+
+sub createSSLConfig {
+
+my $un 		= shift;
+
+debug(1,"Sub createSSLConfig...");
+
+my $config 	= "$KEYDIRECTORY" . "openssl.$un";
+
+debug(5,"Creating config $config");
+
+open(OUT,">$config");
+#######################################################################
+print OUT <<"EOF";
+HOME                   = .
+RANDFILE               = \$ENV::HOME/.rnd
+
+[ ca ]
+default_ca      = CA_default            # The default ca section
+unique_subject	= no
+
+[ CA_default ]
+
+dir             = $KEYDIRECTORY         # Where everything is kept
+certs           = \$dir                  # Where the issued certs are kept
+crl_dir         = \$dir                  # Where the issued crl are kept
+database        = \$dir/index.txt        # database index file.
+new_certs_dir   = \$dir                  # default place for new certs.
+certificate     = \$dir/ca.crt           # The CA certificate
+serial          = \$dir/serial           # The current serial number
+crl             = \$dir/crl.pem          # The current CRL
+private_key     = \$dir/ca.key           # The private key
+RANDFILE        = \$dir/.rand            # private random number file
+x509_extensions = usr_cert              # The extentions to add to the cert
+default_days    = 3650                  # how long to certify for
+default_crl_days= 30                    # how long before next CRL
+default_md      = md5                   # which md to use.
+preserve        = no                    # keep passed DN ordering
+policy          = policy_match
+
+[ policy_match ]
+countryName            = match
+stateOrProvinceName    = optional
+organizationName       = match
+organizationalUnitName = optional
+commonName             = optional
+emailAddress           = optional
+
+[ policy_anything ]
+countryName            = optional
+stateOrProvinceName    = optional
+localityName           = optional
+organizationName       = optional
+organizationalUnitName = optional
+commonName             = optional
+emailAddress           = optional
+
+[ req ]
+default_bits           = 1024
+default_keyfile        = keyfile.pem
+distinguished_name     = req_distinguished_name
+attributes             = req_attributes
+prompt                 = no
+output_password        = mypass
+
+[ req_distinguished_name ]
+C                      = US
+ST                     = TEXAS
+L                      = AUSTIN
+O                      = Beginnerprise Solutions
+CN                     = $un
+emailAddress           = $un\@beginnerprise.com
+
+[ req_attributes ]
+challengePassword      = Blowme I Mean Blowfish
+
+[ usr_cert ]
+basicConstraints=CA:FALSE
+nsComment              = "OpenSSL Generated Certificate"
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer:always
+EOF
+#######################################################################
+
+debug(10,"Finished Creating config $config");
+
+return($config);
+
+}
+
+#######################################################################
+## Main Program
+#######################################################################
+
+&main();
+exit(0);

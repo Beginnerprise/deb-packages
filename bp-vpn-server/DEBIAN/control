@@ -1,0 +1,7 @@
+Package: bp-vpn-server
+Version: 0.1
+Depends: bp-server,apache2
+Architecture: all
+Maintainer: Software Engineering <engineering@beginnerprise.com>
+Description: Primary Beginnerprise VPN Server Package
+ This package installs the VPN Server gateway

@@ -6,15 +6,15 @@ if ($ARGV[0] eq "configure")
 
   ### Get domain user name
 
-  print "What username would you like to use to join the domain [SRB.LOCAL]:  ";
+  print "What username would you like to use to join the domain [BP.LOCAL]:  ";
   $un = <STDIN>; chomp($un);
 
   ### Configure VIM Settings for the root user
   my @commands 	= ();
 
-  push(@commands,"domainjoin-cli join srb.local $un");
+  push(@commands,"domainjoin-cli join bp.local $un");
   push(@commands,"/opt/pbis/bin/config LoginShellTemplate /bin/bash");
-  push(@commands,"/opt/pbis/bin/config RequireMembershipOf SRB\\\\domain^admins SRB\\\\unixlogins");
+  push(@commands,"/opt/pbis/bin/config RequireMembershipOf BP\\\\domain^admins BP\\\\unixlogins");
   push(@commands,'/opt/pbis/bin/config HomeDirTemplate %H/%D/%U');
   push(@commands,'/opt/pbis/bin/config AssumeDefaultDomain true');
   push(@commands,'/opt/pbis/bin/ad-cache --delete-all > /dev/null; getent group | grep uni > /dev/null 2>&1');

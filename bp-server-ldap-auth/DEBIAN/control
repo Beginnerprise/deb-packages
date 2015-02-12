@@ -2,6 +2,6 @@ Package: bp-server-ldap-auth
 Version: 0.1
 Depends: sudo,pbis-open,pbis-open-gui,pbis-open-upgrade
 Architecture: all
-Maintainer: Software Engineering <internaldevelopment@srbok.com>
+Maintainer: Software Engineering <internaldevelopment@bpok.com>
 Description: Debian LDAP Auth Package
  This package sets up Active Directory authentication for Beginnerprise Servers

@@ -1,7 +1,7 @@
-Package: srr-mirrormanager
+Package: bp-mirrormanager
 Version: 0.1
 Architecture: all
-Depends: srr-perl-modules, libexpect-perl
-Maintainer: Information Technology <internalsupport@srbok.com>
+Depends: bp-perl-modules, libexpect-perl
+Maintainer: Information Technology <internalsupport@bpok.com>
 Description: Installs an automated mirror manager
- Manages setting up the primary mirroring on a Smith Roberts server
+  Automate OS Drive duplication and failover setup on secondary drive

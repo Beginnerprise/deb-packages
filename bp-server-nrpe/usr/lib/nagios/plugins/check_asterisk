@@ -1,0 +1,106 @@
+#! /usr/bin/perl -w
+# 
+# check_ser: Nagios plugin for checking SER using sipsak.
+# Alex Mayrhofer, nic.at <axelm at nic.at> 
+# no warranty, licensed GPL2
+# modified to work with Asterisk by <ricvil at telesip.net> 
+
+use strict;
+use Getopt::Long;
+use vars qw($opt_w $opt_c $opt_U $param $PROGNAME $warning
+$url $host $password);
+use lib "/usr/lib/nagios/plugins";
+use utils qw(%ERRORS &print_revision &support &usage);
+$PROGNAME="check_asterisk";
+sub print_help ();
+sub print_usage ();
+
+delete @ENV{'PATH', 'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+Getopt::Long::Configure('bundling', 'no_ignore_case');
+GetOptions
+("V|version"    => \&version,
+ "h|help"       => \&help,
+ "w|warning=s"  => \$opt_w,
+ "c|critical=s" => \$opt_c,
+ "U|url=s" => \$opt_U,);
+
+($opt_U) || ($opt_U = shift) || usage("URL not specified\n");
+# TODO: allow port and parameters?
+my $url = $1 if ($opt_U =~ m/^(sip:[a-zA-Z0-9_\+\*#]+\@[a-zA-Z0-9\.]+)$/);
+($url) || usage("Invalid URL: $opt_U\n");
+
+($opt_w) || ($opt_w = shift) || usage("Warning threshold not specified\n");
+$warning = $1 if ($opt_w =~ /([0-9]+)$/);
+($warning) || usage("Invalid warning threshold: $opt_w\n");
+
+ ($opt_c) || ($opt_c = shift) || usage("Critical threshold not specified\n");
+my $critical = $1 if ($opt_c =~ /([0-9]+)$/);
+($critical) || usage("Invalid critical threshold: $opt_c\n");
+my $sig=0;
+my $param=0;
+
+#Put UDP port that the Asterisk SIP stack is listening on after the '-r' below
+$param =  "-s $url -vv -r 5066" ;
+$sig = `/usr/local/bin/sipsak $param`;
+
+if ($sig !~ m/404 Not Found/) {
+   print "SIP CRITICAL - missing 404 reply\n";
+   exit $ERRORS{'CRITICAL'};
+   }
+if ($sig !~ m/reply received after ([0-9\.]+) ms/) {
+if ($sig !~ m/reply received ([0-9\.]+) ms after first send/) {
+    print "SIP CRITICAL - missing duration value\n";
+    exit $ERRORS{'CRITICAL'};
+  } else {
+        $sig = $1;
+   }
+} else {
+  $sig = $1;
+}
+if ($sig>$critical) {
+print "SIP CRITICAL - Test Duration: $sig ms\n";
+exit $ERRORS{'CRITICAL'};
+}
+
+if ($sig>$warning) {
+print "SIP WARNING - Test Duration: $sig ms\n";
+exit $ERRORS{'WARNING'}
+}
+
+print "SIP OK - Test Duration: $sig ms\n";
+exit $ERRORS{'OK'};
+
+sub print_usage () {
+print "Usage: $PROGNAME  -U <sip url> -w <warn> -c <crit>\n";
+}
+
+sub print_help () {
+print_revision($PROGNAME,'version 0.1');
+print "Copyright (c) 2003 nic.at (Alexander Mayrhofer)
+
+This plugin tests Asterisk SIP Channel.
+
+";
+print_usage();
+print "
+-U, --url=STRING
+  SIP URL to use for check
+-w, --warning=INTEGER
+   response time in ms above which a WARNING status will result
+-c, --critical=INTEGER
+  response time in ms above which a CRITICAL status will result
+
+";
+support();
+}
+
+sub version () {
+print_revision($PROGNAME,'Version: 0.1');
+exit $ERRORS{'OK'};
+}
+
+sub help () {
+print_help();
+exit $ERRORS{'OK'};
+} 

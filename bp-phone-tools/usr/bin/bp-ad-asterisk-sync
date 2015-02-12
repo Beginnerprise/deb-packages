@@ -1,0 +1,1148 @@
+#! /usr/bin/perl
+
+#############################################################################################
+## Author:      Benjamin Hudgens
+## Date:        May 14, 2011
+##
+## Description:
+##              Script that syncs Active Directory with Asterisk and deploys
+##              an asterisk installation
+#############################################################################################
+
+use Beginnerprise::Standard;
+use Beginnerprise::LDAP;
+use MIME::Entity;
+use Data::Dumper;
+use File::Copy qw(copy);
+
+$SIG{'TERM'}    = \&shutdown;
+
+#############################################################################################
+##  Global Variables and Defaults
+#############################################################################################
+
+## Domain Controller We want to connect to
+my $domain 			= 'dc1.bp.local'; # We specifically specify a DC to avoid out-of-sync DC's from causing weird deployments
+## Full Distinguished Name of the LDAP User we'll use to pull phone data
+my $username 			= 'CN=User,OU=Users,DC=bp,DC=local';
+## Password for AD User
+my $password 			= '';
+## Root DN to use for our search
+my $baseDN	 		= 'DC=bp,DC=local';
+## Directory we'll setup to work out of
+my $cacheDir			= '/tmp/bp-ad-asterisk-sync/' . $$;
+my $cachePhoneConfigsDir	= "$cacheDir\/phoneconfigs";
+## Polycom Phone Template File
+my $templateDir        		= '/tftpboot';
+my $templateFile        	= $templateDir . '/000000000000-phone.template';
+## Phone Directory File
+my $phoneDirectoryFile		= '000000000000-directory.xml';
+## Asterisk Path
+my $asteriskPath		= '/etc/asterisk';
+## Master Voicemail File
+my $voicemailFile		= 'voicemail.conf';
+## Master Sip File
+my $sipFile			= 'sip.conf';
+## Flash Operator Config Dir
+my $fopDir        		= '/usr/local/fop2';
+my $buttonsFile        		= 'operator.cfg';
+## Voicemail Audio Dir
+my $voicemailAudioDir		= '/var/spool/asterisk/voicemail/default';
+## Sendmail daemon
+my $sendmail 			= '/usr/sbin/sendmail';
+
+my $isDeployEnabled		= undef;
+my $isTestRun			= undef;
+my $isPurgeStalePhonesEnabled	= undef;
+my $isRebootAllPhonesEnabled	= undef;
+my $isConfigureFOPEnabled	= undef;
+my $isDeployForced		= undef;
+my $isVoicemailAuditOnly	= undef;
+my $isSendEmailEnabled		= undef;
+
+my $opts		= ();
+my @errors		= ();
+my @reports		= ();
+
+sub main
+{
+  &initialize();
+
+  my $phones = &getPhoneDataFromActiveDirectory();
+
+  if ($isPurgeStalePhonesEnabled)
+  {
+    &doPurgeStalePhones($phones);
+  }
+
+  if ($isVoicemailAuditOnly)
+  {
+    &doVoicemailNameAudit($phones);
+    &shutdown();
+  }
+
+  if ($isRebootAllPhonesEnabled)
+  {
+    &doRebootAllPhones($phones);
+    &shutdown();
+  }
+
+  ## Create Configs
+  &doCreateSipConfig($phones);
+
+  ## Now that a tmp sip file is created check if it's different
+  ## If not different then we do not need to proceed
+  if (!&isDeployNecessary() && !$isTestRun && !$isDeployForced) { &shutdown() };
+
+  &doCreatePhoneConfigs($phones);
+  &doCreatePhoneDirectory();
+  &doCreateVoicemailConfig($phones);
+  &doVoicemailNameAudit($phones);
+
+  if ($isConfigureFOPEnabled)
+  {
+    &doCreateFOPConfig($phones);
+  }
+
+  ## Deployments
+  if ($isDeployEnabled)
+  {
+    &doDeployment($phones);
+  }
+}
+
+sub usage
+{
+  &say ("                                                 ");
+  &say ("Beginnerprise Solutions AD to Asterisk Sync      ");
+  &say ("Copyright (C) 2000-2014                          ");
+  &say ("-------------------------------------------------");
+  &say ("                                                 ");
+  &say ("Usage:                                           ");
+  &say ("$0 [-fprRvhtx] [-r extension] [-d level]         ");
+  &say ("                                                 ");
+  &say (" -d Set the debug level                          ");
+  &say (" -f Configure FOP Panel                          ");
+  &say (" -h This help message                            ");
+  &say (" -p Purge Stale Phones                           ");
+  &say (" -r Reboot Extension                             ");
+  &say (" -R Reboot All Phones                            ");
+  &say (" -t Test Run - Skip Deploy                       ");
+  &say (" -v voicemail audit 	                            ");
+  &say (" -v Send Email Notice During Voicemail Audit     ");
+  &say (" -x Force Deployment                             ");
+  &say ("                                                 ");
+}
+
+
+sub initialize
+{
+
+  $opts = &getCommandLineOptions('phtRfxVvr:d:'); # colon means takes argument / just letter is boolean
+
+  if (!$opts)   # we had an error
+  {
+    &usage();
+    exit(0);
+  }
+
+  if ($opts->{'h'})
+  {
+    &usage();
+    &shutdown();
+  }
+
+  if ($opts->{'d'})
+  {
+    &setDebugLevel($opts->{'d'});
+    &debug(1,"debug level set: $opts->{'d'}");
+  }
+
+  if ($opts->{'r'})
+  {
+    `asterisk -rx'sip notify polycom-check-cfg $opts->{'r'}'`;
+    &shutdown();
+  }
+
+  if ($opts->{'x'})
+  {
+    $isDeployForced = 1;
+    $isDeployEnabled = 1;
+  }
+
+  if ($opts->{'f'})
+  {
+    $isConfigureFOPEnabled = 1;
+  }
+
+  if ($opts->{'R'})
+  {
+    $isRebootAllPhonesEnabled = 1;
+  }
+
+  if ($opts->{'v'})
+  {
+    $isVoicemailAuditOnly = 1;
+  }
+
+  if ($opts->{'V'})
+  {
+    $isVoicemailAuditOnly = 1;
+    $isSendEmailEnabled = 1;
+  }
+
+  if ($opts->{'t'})
+  {
+    $isTestRun = 1;
+  }
+
+  if ($opts->{'p'})
+  {
+    $isPurgeStalePhonesEnabled = 1;
+  }
+
+  ## build our directory structure for execution
+  if (!-d $cacheDir)
+  {
+    `mkdir -p $cachePhoneConfigsDir`;
+
+    if (!-d $cacheDir)
+    {
+      &hError("Could not create working cache");
+    }
+
+
+  }
+
+}
+
+
+sub shutdown
+{
+  # we get called even if we are sent a kill()
+  # make sure to clean up 'anything' we are doing
+  # we can get called at any time
+  # keep track of open files and various other things so they can get cleaned up
+
+  ## if not in debug mode clear our cache directory when we're done
+  if (!$opts->{'d'})
+  {
+    `rm -rf $cachedir`;
+  }
+
+
+  if (@reports > 0)
+  {
+    &say("Beginnerprise Solutions Asterisk Phone Deployment Report");
+    &say("---------------------------------------------------------");
+    foreach my $report (@reports)
+    {
+      &say($report);
+    }
+  }
+
+  if (@errors > 0)
+  {
+    &say("********************!!!ERRORS!!!*************************");
+    foreach my $error (@errors)
+    {
+      &say($error);
+    }
+  }
+  if (@reports > 0 || @errors > 0)
+  {
+    &say("---------------------------------------------------------");
+  }
+
+  exit(0);
+}
+
+sub doVoicemailNameAudit
+{
+  my $phones = shift;
+
+  foreach my $mac (keys %{$phones})
+  {
+    if (!-f "$voicemailAudioDir/$phones->{$mac}->{'extension'}/greet.wav")
+    {
+      &error("User [$phones->{$mac}->{'firstname'} $phones->{$mac}->{'lastname'}] extension [$phones->{$mac}->{'extension'}] has not recorded their name");
+      if ($isSendEmailEnabled)
+      {
+        my $toAddress = "$phones->{$mac}->{'email'}";
+        #my $toAddress = 'benjamin.hudgens@bpok.com';
+        my $fromAddress = 'helpme@bpok.com';
+        my $subject = 'Warning - Voicemail Name Is Not Recorded';
+        my @text = ();
+
+        push(@text,"[This email is auto-generated]\n");
+        push(@text,"\n");
+        push(@text,"Dear $phones->{$mac}->{'firstname'} $phones->{$mac}->{'lastname'},\n");
+        push(@text,"\n");
+        push(@text,"Your name has not been recorded in your voicemail.  You will received a notice once per day. ");
+        push(@text,"Please take the following steps to record your name:\n");
+        push(@text,"\n");
+        push(@text,"-- Hit the 'Messages' button on your phone\n");
+        push(@text,"-- Enter the default password [$phones->{$mac}->{'extension'}]\n");
+        push(@text,"-- Follow the prompts to record your greeting\n");
+        push(@text,"-- Change your password to something other than [$phones->{$mac}->{'extension'}]\n");
+        push(@text,"\n");
+        push(@text,"Leaving your password as the default will signal to the system your account is still not configured.\n");
+        push(@text,"\n");
+        push(@text,"Thank you for your assistance!\n");
+        push(@text,"Helpdesk\n");
+
+        &error("Sending Email to $toAddress");
+        &sendEmail($toAddress,$fromAddress,$subject,\@text);
+
+      }
+    }
+  }
+
+}
+
+sub isDeployNecessary ()
+{
+  &debug(11,"..sub isDeployNecessary");
+  my $chk = `diff $cacheDir/$sipFile $asteriskPath/$sipFile`;
+  #&debug(1,"Results of Check: $chk");
+  &debug(1,"diff $cacheDir/$sipFile $asteriskPath/$sipFile");
+  if ($chk eq "")
+  {
+    &debug(12,"Deployment is Not Required");
+    return undef;
+  }
+
+  &debug(12,"Deployment is Required");
+  $isDeployEnabled = 1;
+  return 1;
+}
+
+sub doDeployment
+{
+
+  my $phones 		= shift;
+
+  my @commands	= ();
+
+  push(@commands,"mv $asteriskPath/$sipFile $asteriskPath/$sipFile.bak");
+  push(@commands,"mv $cacheDir/$sipFile $asteriskPath/$sipFile");
+
+  push(@commands,"mv $asteriskPath/$voicemailFile $asteriskPath/$voicemailFile.bak");
+  push(@commands,"mv $cacheDir/$voicemailFile $asteriskPath/$voicemailFile");
+
+  push(@commands,"chmod 444 $templateDir/????????????-phone.cfg");
+
+  foreach my $mac (keys %{$phones})
+  {
+
+    if (-f "$templateDir/$mac-directory.xml")
+    {
+      push(@commands,"rm $templateDir/$mac-directory.xml");
+    }
+    push(@commands,"ln -s /tftpboot/000000000000-directory.xml $templateDir/$mac-directory.xml");
+
+  }
+
+  push(@commands,"rsync -ruv $cachePhoneConfigsDir/ $templateDir/ > /dev/null");
+
+  # Remove local cache for callerid.pl AGI on a deployment
+  # TODO: This should be cleaned up.  A library that is shared would be more appropriate
+  push(@commands,"rm /tmp/tmpphones.xml");
+
+  push(@commands,"/usr/sbin/asterisk -rx'reload'");
+
+  push(@commands,"mv $cacheDir/$phoneDirectoryFile $templateDir/$phoneDirectoryFile");
+  push(@commands,"chmod 644 $templateDir/$phoneDirectoryFile");
+  &report("Deployed New Phone Directory $templateDir/$phoneDirectoryFile");
+
+  if ($isConfigureFOPEnabled)
+  {
+    push(@commands,"/etc/init.d/fop2 restart > /dev/null");
+    &report("Deployed new Flash Operator Panel Update");
+  }
+
+  foreach my $cmd (@commands)
+  {
+    &debug(19,"CMD: $cmd");
+    if (!$isTestRun)
+    {
+      system($cmd);
+    }
+  }
+
+}
+
+
+sub doCreatePhoneConfigs
+{
+  &debug(11,"..sub doCreatePhoneConfigs");
+
+  ## accept our list of phones in ad
+  my $phones = shift;
+
+  ## read in the template file for phone configs
+  &debug(11,"Opening Template File: $templateFile");
+  open(FILE,"< $templateFile");
+  @templateFileLines 		= <FILE>;
+  @templateFileLinesMaster 	= @templateFileLines;
+  close(FILE);
+
+  ## loop through our phones and create phone configs for all in ad
+  foreach my $mac (keys %{$phones})
+  {
+
+    $templatevalues{'EXTENSION'} 	= $phones->{$mac}->{'extension'};
+    $templatevalues{'PASSWORD'} 	= $phones->{$mac}->{'extension'};
+    $templatevalues{'LABEL'} 	= $phones->{$mac}->{'extension'};
+    $templatevalues{'COMPANY'} 	= lc($phones->{$mac}->{'company'});
+    if ($phones->{$mac}->{'firstname'} =~ /jerod/i) { $templatevalues{'COMPANY'} = lc($phones->{$mac}->{'company'} . "lh")};
+    $templatevalues{'FULLNAME'} 	= $phones->{$mac}->{'firstname'} . " " . $phones->{$mac}->{'lastname'};
+
+    &debug(12,"Generating Config for Mac Address: $mac [$phones->{$mac}->{'extension'}]");
+
+    &debug(19,"Output To File: $cachePhoneConfigsDir/$mac-phone.cfg");
+    open(OUT,"> $cachePhoneConfigsDir/$mac-phone.cfg");
+
+    @templateFileLines = @templateFileLinesMaster;
+
+    foreach $line (@templateFileLines) {
+
+      foreach $key (keys %templatevalues) {
+
+        if ($line =~ m/\_\_$key\_\_/) {
+          $line =~ s/\_\_$key\_\_/$templatevalues{$key}/g;
+        }
+
+      }
+
+      print OUT $line;
+      if ($opts->{'d'})
+      {
+        chomp($line);
+        &debug(19,"$line");
+      }
+    }
+
+    close(OUT);
+  }
+}
+
+
+sub doCreateVoicemailConfig
+{
+
+  &debug(11,"..sub doCreateVoicemailConfig");
+
+  # Get the Phones from AD
+  my $phones = shift;
+  # Copy Voicemail Config
+
+  my $cmd = "cp $asteriskPath/$voicemailFile $cacheDir/$voicemailFile";
+  &debug(12,"Copying Master File to Cache");
+  &debug(19,"CMD: $cmd");
+
+  system($cmd);
+  # Slurp in the Current Config
+
+  &debug(12,"Reading in Temp Voicemail File: $cacheDir/$voicemailFile");
+  open(IN,"< $cacheDir\/$voicemailFile");
+  my @vmLines = <IN>;
+  close(IN);
+
+  # Build Extension Hash for Performance
+  %extensionHash	= ();
+
+  foreach my $mac (keys %{$phones})
+  {
+    $extensionHash{$phones->{$mac}->{'extension'}} = $mac;
+  }
+
+  # Add Any Missing Extensions
+  &debug(12,"Adding Missing Extensions to Voicemail Config");
+  foreach my $mac (keys %{$phones})
+  {
+    my $extension 		= $phones->{$mac}->{'extension'};
+    my $fullname 		= $phones->{$mac}->{'firstname'} . " " . $phones->{$mac}->{'lastname'};
+    my $email 		= $phones->{$mac}->{'email'};
+    my $foundExtension	= undef;
+
+    if ($email eq "")
+    {
+      &debug(14,"Skipping Phone [$mac] - [$extension]");
+      next;
+    }
+
+    $options = "";
+    $options .= "saycid=yes|dialout=fromvm|callback=fromvm|review=yes|";
+    $options .= "saydurationm=1|sayduration=yes|envelope=yes|operator=yes";
+    $options .= "|delete=1|attach=yes";
+
+    foreach $line (@vmLines) {
+
+
+      if ($line =~ m/$extension =>/) {
+
+
+        $foundExtension = 1;
+
+        &debug(13,"Found Extension [$extension] in the Voicemail Config");
+
+        if ($line =~ m/$extension => (\d+),.*/)
+        {
+          chomp($line);
+
+          my $tmppwd = $1;
+
+          $newLine = "";
+          $newLine .= $extension;
+          $newLine .= " => ";
+          $newLine .= $tmppwd;
+          $newLine .= ",";
+          $newLine .= $fullname;
+          $newLine .= ",";
+          $newLine .= $email;
+          $newLine .= ",";
+          $newLine .= ",";
+          $newLine .= $options;
+          $newLine .= "\n";
+
+          $line =~ s/.*/$newLine/;
+
+        }
+      }
+    }
+
+    if (!$foundExtension) {
+
+      $newLine = "";
+      $newLine .= $extension;
+      $newLine .= " => ";
+      $newLine .= $extension;
+      $newLine .= ",";
+      $newLine .= $fullname;
+      $newLine .= ",";
+      $newLine .= $email;
+      $newLine .= ",";
+      $newLine .= ",";
+      $newLine .= $options;
+      $newLine .= "\n";
+
+      &debug(14,"Adding line: $newLine");
+      &report("Adding Voicemail For Extension [$extension]");
+
+      push(@vmLines,$newLine);
+    }
+
+  }
+
+  # Delete Extra Extensios
+  &debug(12,"Purging Deprecated Extensions");
+  foreach my $mac (keys %{$phones})
+  {
+    if ($phones->{$mac}->{'email'} ne "") { next; };
+
+    foreach $line (@vmLines) {
+
+      if ($line =~ m/^$extension =>/)
+      {
+
+        &report("Purging Deprecated Mailbox [$extension] - No Email Address");
+
+        $line =~ s/.*\n//;
+        $tmpVMAudio = $voicemailAudioDir . '/' . $extension;
+        if (-d $tmpVMAudio)
+        {
+          `rm -rf $tmpVMAudio`;
+        }
+
+      }
+    }
+  }
+
+  foreach $line (@vmLines) {
+
+    if ($line =~ m/^(\d+) =>/)
+    {
+
+      if (!$extensionHash{$1})
+      {
+        $extension = $1;
+        &report("Purging Mailbox [$extension] - Doesn't Exist in AD");
+
+        $line =~ s/.*\n//;
+        $tmpVMAudio = $voicemailAudioDir . '/' . $extension;
+        if (-d $tmpVMAudio)
+        {
+          `rm -rf $tmpVMAudio`;
+        }
+      }
+
+    }
+  }
+
+  # Output New VMail Cache File
+  open(OUT,"> $cacheDir/$voicemailFile");
+  foreach my $line (@vmLines)
+  {
+    print OUT $line;
+  }
+  close(OUT);
+
+}
+
+sub doCreatePhoneDirectory {
+
+  &debug(11,"..sub doCreatePhoneDirectory");
+
+  @files = `ls $templateDir/*-phone.cfg`;
+
+  my $head = "";
+  $head .= "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n";
+  $head .= "<directory>\n";
+  $head .= "  <item_list>\n";
+  push(@newDirectory,$head);
+
+  # Push Conference Bridge Soft Key
+
+  #    my $template = "";
+  #    $template .= "    <item>\n";
+  #    $template .= "          <ln></ln>\n";
+  #    $template .= "          <fn>" . 'GoToMeet' . "</fn>\n";
+  #    $template .= "          <ct>" . '1001' . "</ct>\n";
+  #    $template .= "          <rt></rt>\n";
+  #    $template .= "          <dc />\n";
+  #    $template .= "          <sd>1</sd>\n";
+  #    $template .= "          <ad>0</ad>\n";
+  #    $template .= "          <ar>0</ar>\n";
+  #    $template .= "          <bw>0</bw>\n";
+  #    $template .= "          <bb>0</bb>\n";
+  #    $template .= "     </item>\n";
+  #    $template .= "     ???\n";
+  #
+  #    push(@newDirectory,$template);
+
+  # Push Conference Bridge Soft Key
+
+  #    my $template = "";
+  #    $template .= "    <item>\n";
+  #    $template .= "          <ln></ln>\n";
+  #    $template .= "          <fn>" . 'Intercom' . "</fn>\n";
+  #    $template .= "          <ct>" . '1200' . "</ct>\n";
+  #    $template .= "          <rt></rt>\n";
+  #    $template .= "          <dc />\n";
+  #    $template .= "          <sd>2</sd>\n";
+  #    $template .= "          <ad>0</ad>\n";
+  #    $template .= "          <ar>0</ar>\n";
+  #    $template .= "          <bw>0</bw>\n";
+  #    $template .= "          <bb>0</bb>\n";
+  #    $template .= "     </item>\n";
+  #    $template .= "     ???\n";
+  #
+  #    push(@newDirectory,$template);
+
+  foreach $file (@files) {
+
+    $name   = undef;
+    $exten  = undef;
+
+    chomp($file);
+    &debug(12,"Working on file $file");
+    open(INPUT,"<$file");
+    while (<INPUT>) {
+
+      &debug(101,"Line: $_");
+      if (m/displayName=\"(.*?)\"/) { $name = $1 };
+      if (m/reg.1.address=\"(.*?)\"/) { $exten = $1 };
+
+    }
+    close(INPUT);
+
+    if (!$name) { next };
+
+    my $template = "";
+    $template .= "    <item>\n";
+    $template .= "          <ln></ln>\n";
+    $template .= "          <fn>" . $name . "</fn>\n";
+    $template .= "          <ct>" . $exten . "</ct>\n";
+    $template .= "          <rt></rt>\n";
+    $template .= "          <dc />\n";
+    $template .= "          <sd></sd>\n";
+    $template .= "          <ad>0</ad>\n";
+    $template .= "          <ar>0</ar>\n";
+    $template .= "          <bw>0</bw>\n";
+    $template .= "          <bb>0</bb>\n";
+    $template .= "     </item>\n";
+    $template .= "     ???\n";
+
+    push(@newDirectory,$template);
+
+  }
+
+  my $foot = undef;
+  $foot .= "  </item_list>\n";
+  $foot .= "</directory>\n";
+  push(@newDirectory,$foot);
+
+  $tmpDirectoryFile = "$cacheDir/$phoneDirectoryFile";
+  &debug(13,"Creating tmp file $tmpDirectoryFile");
+
+  open(OUTPUT,">$tmpDirectoryFile");
+  foreach (@newDirectory) { print OUTPUT };
+  close(OUTPUT);
+
+
+}
+
+sub doCreateFOPConfig
+{
+
+  &debug(11,"..sub doCreateFOPConfig");
+
+  # Get the Phones from AD
+  my $phones = shift;
+
+  my @fopLines	= ();
+
+  # Reset Check Variable
+  foreach my $mac (keys %{$phones})
+  {
+    my $extension           = $phones->{$mac}->{'extension'};
+    my $password          	= $phones->{$mac}->{'extension'};
+    my $fullname            = $phones->{$mac}->{'firstname'} . " " . $phones->{$mac}->{'lastname'};
+    my $email               = $phones->{$mac}->{'email'};
+
+    # Resetting Check Variable
+    $newphone = "";
+    $newphone .= "[SIP/$extension]\n";
+    $newphone .= "type=extension\n";
+    $newphone .= "extension=$extension\n";
+    $newphone .= "context=call-internal-noanswer\n";
+    $newphone .= "label=$fullname\n";
+    $newphone .= "mailbox=$extension\@default\n";
+    $newphone .= "\n";
+
+    push(@fopLines,$newphone);
+    &debug(17,"New FOP Phone Configures for [$fullname] - Extension [$extension] - Mac [$mac]");
+  }
+
+  push(@fopLines,"[DAHDI/i1]\n");
+  push(@fopLines,"type=trunk\n");
+  push(@fopLines,"label=DAHDI\n");
+  for ($c = 2; $c <=24; $c++)
+  {
+    push(@fopLines,"channel=DAHDI/i$c\n");
+  }
+  push(@fopLines,"\n");
+
+
+  push(@fopLines,"[PARK/default]\n");
+  push(@fopLines,"type=park\n");
+  push(@fopLines,"label=park\n");
+  push(@fopLines,"context=parkedcalls\n");
+
+  # Output New VMail Cache File
+  open(OUT,"> $fopDir/$buttonsFile");
+  foreach my $line (@fopLines)
+  {
+    print OUT $line;
+  }
+  close(OUT);
+
+  # Build Company FOP configs
+
+  my %companyHash      = ();
+  foreach my $mac (keys %{$phones})
+  {
+    if ($phones->{$mac}->{'company'} ne "")
+    {
+      $companyHash{$phones->{$mac}->{'company'}} = $mac;
+    }
+  }
+
+  foreach my $company (keys %companyHash)
+  {
+
+    &debug(19, "C: $company");
+    if ($company eq "") { next };
+
+
+    my @fopLines	= ();
+
+    # Reset Check Variable
+    foreach my $mac (keys %{$phones})
+    {
+      if ($phones->{$mac}->{'company'} eq $company)
+      {
+        my $extension           = $phones->{$mac}->{'extension'};
+        my $password          	= $phones->{$mac}->{'extension'};
+        my $fullname            = $phones->{$mac}->{'firstname'} . " " . $phones->{$mac}->{'lastname'};
+        my $email               = $phones->{$mac}->{'email'};
+
+        # Resetting Check Variable
+        $newphone = "";
+        $newphone .= "[SIP/$extension]\n";
+        $newphone .= "type=extension\n";
+        $newphone .= "extension=$extension\n";
+        $newphone .= "context=call-internal-noanswer\n";
+        $newphone .= "label=$fullname\n";
+        $newphone .= "mailbox=$extension\@default\n";
+        $newphone .= "\n";
+
+        push(@fopLines,$newphone);
+        &debug(17,"New FOP Phone Configures for [$fullname] - Extension [$extension] - Company [$company]");
+      }
+    }
+
+    push(@fopLines,"[DAHDI/i1]\n");
+    push(@fopLines,"type=trunk\n");
+    push(@fopLines,"label=DAHDI\n");
+    for ($c = 2; $c <=24; $c++)
+    {
+      push(@fopLines,"channel=DAHDI/i$c\n");
+    }
+    push(@fopLines,"\n");
+
+
+    push(@fopLines,"[PARK/default]\n");
+    push(@fopLines,"type=park\n");
+    push(@fopLines,"label=park\n");
+    push(@fopLines,"context=parkedcalls\n");
+
+    $company = uc($company);
+
+    # Output New VMail Cache File
+    &debug(17, "Saving FOP Config to: $fopDir/$company.cfg");
+    open(OUT,"> $fopDir/$company.cfg");
+    foreach my $line (@fopLines)
+    {
+      print OUT $line;
+    }
+    close(OUT);
+
+  }
+}
+
+sub doCreateSipConfig
+{
+
+  &debug(11,"..sub doCreateSipConfig");
+
+  # Get the Phones from AD
+  my $phones = shift;
+
+  my $cmd = "cp $asteriskPath/$sipFile $cacheDir/$sipFile";
+  &debug(12,"Copying Master File to Cache");
+  &debug(19,"CMD: $cmd");
+  system($cmd);
+
+  # Slurp in the Current Config
+  &debug(12,"Reading in Temp Sip File: $cacheDir/$sipFile");
+  open(IN,"< $cacheDir\/$sipFile");
+  my @sipLines = <IN>;
+  close(IN);
+
+  # Build Extension Hash for Performance
+  %extensionHash      = ();
+  foreach my $mac (keys %{$phones})
+  {
+    $extensionHash{$phones->{$mac}->{'extension'}} = $mac;
+  }
+
+  # Add Any Missing Extensions
+  &debug(12,"Adding Missing Extensions to Sip Config");
+
+  # Reset Check Variable
+  my $inConfig = undef;
+
+  foreach my $mac (keys %{$phones})
+  {
+    my $extension           = $phones->{$mac}->{'extension'};
+    my $password          	= $phones->{$mac}->{'extension'};
+    my $fullname            = $phones->{$mac}->{'firstname'} . " " . $phones->{$mac}->{'lastname'};
+    my $email               = $phones->{$mac}->{'email'};
+
+    # Resetting Check Variable
+    my $foundPhone = undef;
+
+    foreach $line (@sipLines) {
+
+      if ($line =~ m/^\[$extension\]/) {
+        $foundPhone = 1;
+        $inConfig = 1;
+        &debug(14,"Found Extension [$extension] in the Sip Config");
+        next;
+      }
+
+      if ($line =~ m/^\[\w+\]/) { $inConfig = undef };
+
+      if ($inConfig && $line =~ m/secret=/) {
+        &debug(16,"Setting Extension [$extension] secret to [$password]");
+        $line =~ s/secret=\w+/secret=$password/;
+      }
+
+      if ($inConfig && $line =~ m/username=/) {
+        &debug(16,"Setting Extension [$extension] username to [$extension]");
+        $line =~ s/username=\w+/username=$extension/;
+      }
+
+      if ($inConfig && $line =~ m/mailbox=/) {
+        &debug(16,"Setting Extension [$extension] mailbox to [$extension]");
+        $line =~ s/mailbox=\w+/mailbox=$extension/;
+      }
+    }
+
+    if (!$foundPhone) {
+
+      &debug(13,"Extension [$extension] in AD not found in Sip Config so adding");
+
+      $newphone = "";
+      $newphone .= "[$extension]\n";
+      $newphone .= "type=friend\n";
+      $newphone .= "context=main\n";
+      $newphone .= "secret=$extension\n";
+      $newphone .= "host=dynamic\n";
+      $newphone .= "dtmfmode=rfc2833\n";
+      $newphone .= "username=$extension\n";
+      $newphone .= "mailbox=$extension\n";
+      $newphone .= "disallow=all\n";
+      $newphone .= "allow=ulaw\n";
+      $newphone .= "progressinband=no\n";
+      $newphone .= "qualify=yes\n";
+      $newphone .= "\n";
+
+      push(@sipLines,$newphone);
+      &report("New Phone Deployed for [$fullname] - Extension [$extension] - Mac [$mac]");
+
+    }
+  }
+
+  &debug(12,"Purging Deprecated Extensions");
+
+  # Reset Check Variable
+  $inConfig = undef;
+
+  foreach $line (@sipLines) {
+
+    if ($line =~ m/^\[(\d+)\]/)
+    {
+      if (!$extensionHash{$1})
+      {
+        &report("Purging Extension [$1] - Not found in AD");
+        $inConfig = 1;
+        &debug(998,"Purging: $line");
+        $line =~ s/.*\n//;
+        next;
+      }
+      else
+      {
+        $inConfig = undef;
+      }
+    }
+
+    if ($inConfig) {
+      &debug(999,"Purging: $line");
+      $line =~ s/.*\n//;
+      next;
+    }
+  }
+
+  # Output New VMail Cache File
+  open(OUT,"> $cacheDir/$sipFile");
+  foreach my $line (@sipLines)
+  {
+    print OUT $line;
+  }
+  close(OUT);
+}
+
+sub getPhoneDataFromActiveDirectory
+{
+  &debug(11,"..sub getPhoneDataFromActiveDirectory");
+
+  my $phones 		= {};
+  my $ldap = &openLDAPConnection($domain,$username,$password);
+
+  my @search	=
+  (
+  base	=> $baseDN,
+  filter	=> '(otherIpPhone=*)',
+  attrs	=> ['givenName','sn','otherIpPhone','mail','company']
+  );
+
+  $search = \@search;
+
+  my $results = &searchLDAP($ldap,$search);
+
+  ## Debug Info
+  if ($opts->{'d'})
+  {
+    my $count = @{$results};
+    &debug(12,"Found $count object(s) with Phone Data");
+  }
+
+  &debug(999,"#### LDAP Search Results ####\n" . Dumper($results));
+
+  if (@{$results} == 0)
+  {
+    # Failsafe in case AD is gone
+    &shutdown();
+  }
+
+  foreach my $result (@{$results})
+  {
+    foreach my $phone ($result->get_value('otherIpPhone'))
+    {
+      my ($macaddress,$extension) = split(/\|/,$phone);
+
+      if ($extension && $macaddress =~ /^([0-9A-F]{2}[:-]*){5}([0-9A-F]{2})$/i)
+      {
+
+        $macaddress =~ s/[:-]//g;
+        $macaddress = lc($macaddress);
+
+        # Sanity Check Extension
+        my $skip = undef;
+        foreach my $mac (keys %{$phones})
+        {
+          if ($phones->{$mac}->{'extension'} eq $extension)
+          {
+            my $err = "";
+            $err .= "SKIPPED: Extension [$extension] for ";
+            $err .= "[" . $result->get_value('givenName') . " " . $result->get_value('sn') . "]";
+            $err .= " in use for ";
+            $err .= "[$phones->{$mac}->{'firstname'} $phones->{$mac}->{'lastname'}]";
+            &error($err);
+            $skip = 1;
+          }
+        }
+        if ($skip) { next };
+
+        if (!$phones->{$macaddress})
+        {
+          $phones->{$macaddress}->{'extension'} 	= $extension;
+          $phones->{$macaddress}->{'firstname'} 	= $result->get_value('givenName');
+          $phones->{$macaddress}->{'lastname'} 	= $result->get_value('sn');
+          $phones->{$macaddress}->{'email'} 		= $result->get_value('mail');
+          $phones->{$macaddress}->{'company'} 	= uc($result->get_value('company'));
+
+          &debug(14,"FN: " . $phones->{$macaddress}->{'firstname'}  . " " .
+          "LN: " . $phones->{$macaddress}->{'lastname'}  . " " .
+          "EM: " . $phones->{$macaddress}->{'email'}  . " " .
+          "HW: " . $macaddress . " " .
+          "XT: " . $phones->{$macaddress}->{'extension'});
+        }
+        else
+        {
+          my $err = "";
+          $err .= "SKIPPED: Mac [$macaddress] for ";
+          $err .= "[" . $result->get_value('givenName') . " " . $result->get_value('sn') . "]";
+          $err .= " in use for ";
+          $err .= "[$phones->{$macaddress}->{'firstname'} $phones->{$macaddress}->{'lastname'}]";
+          &error($err);
+        }
+      }
+      else
+      {
+        my $err = "";
+        $err .= "SKIPPED: Malformed Phone Configuration [$phone] for ";
+        $err .= $result->get_value('givenName') . " " . $result->get_value('sn');
+        &error($err);
+      }
+    }
+  }
+
+  return($phones);
+}
+
+sub doRebootAllPhones
+{
+  my $phones = shift;
+  &say("WARNING!:  Rebooting Phones Slowly to avoid heavy load on server - this may take a while");
+  foreach my $mac (keys %{$phones})
+  {
+    my $ext = $phones->{$mac}->{'extension'};
+    `asterisk -rx'sip notify polycom-check-cfg $ext'`;
+    &say("Rebooting Extension [$ext]...");
+    #sleep(2);
+  }
+}
+
+sub doPurgeStalePhones
+{
+  my $phones 		= shift;
+
+  my @commands	= ();
+
+  my @phoneConfigs = `ls /tftpboot/????????????-phone.cfg`;
+
+  foreach my $conf (@phoneConfigs)
+  {
+    chomp($conf);
+    if ($conf =~ /.*?\/(\w+)-phone.cfg/)
+    {
+      if (!$phones->{$1})
+      {
+        &report("Purging Phone Configs for $1");
+        push(@commands,"rm $templateDir/$1*")
+      }
+    }
+  }
+
+  foreach my $cmd (@commands)
+  {
+    &debug(19,"CMD: $cmd");
+    if (!$isTestRun)
+    {
+      system($cmd);
+    }
+  }
+
+}
+
+sub sendEmail {
+
+  my $toAddress = shift;
+  my $fromAddress = shift;
+  my $subject = shift;
+  my $text = shift;
+
+  my @finalEmailText = @{$text};
+
+  my $mimeObject      = undef;
+
+  open(SENDMAIL,"| $sendmail -t -oi -oem");
+
+  $mimeObject         = MIME::Entity->build(
+  Type      => 'multipart/alternative',
+  From      => "$fromAddress",
+  To        => "$toAddress",
+  Subject   => "$subject",
+  Encoding  => '8bit'
+  );
+
+  $mimeObject->attach(
+  Data    =>      [@finalEmailText],
+  Type    =>      'text/plain',
+  Charset =>      'iso-8859-1',
+  Filename=>      undef,
+  Encoding=>      'quoted-printable'
+  );
+
+  $mimeObject->print(\*SENDMAIL);
+  close(SENDMAIL);
+
+}
+
+
+sub report
+{
+  push(@reports,shift);
+}
+
+sub error
+{
+  push(@errors,shift);
+}
+
+&main();
+&shutdown();

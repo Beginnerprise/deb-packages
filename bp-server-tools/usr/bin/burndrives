@@ -1,0 +1,294 @@
+#! /usr/bin/perl
+
+#################################################################################
+## Author:  		Benjamin Hudgens
+## Date:		April 4, 2013
+##
+## Description:		Burn in all the drives mounted on this machine
+##
+#################################################################################
+
+use SRR::Standard;
+use Net::SMTP;
+use POSIX ":sys_wait_h";
+
+$SIG{CHLD} = \&zombieKiller;
+
+&setDebugLevel(100);
+
+sub main()
+{
+
+    my $drives = &getDrives();
+
+    &initialize();
+
+
+    my @children = ();
+
+    foreach my $drive (keys %{$drives})
+    {
+
+        ## If the drive is small and probably a usb stick.. skip it
+	if ($drives->{$drive} < 10000000000)
+	{
+	    next;
+	}
+
+	#&say("D: 8000000000");
+	#&say("D: $drives->{$drive}");
+
+	&debug(9,"Starting Child for [$drive]");
+
+	$child = &getChild();
+
+	if ($child)
+	{
+	    ## We are the parent
+	    push(@children,$child);
+	}
+	else 
+	{
+  	    # Let's get our output file for this drive
+	    my $clean = $drive;
+	    $clean =~ s/\//-/g;
+
+	    my $outputBuffer = "/tmp/$clean.output";
+	    my $outputBadBlocks = "/tmp/$clean.badblocks";
+
+	    open(OUT,">$outputBuffer");
+
+	    my $time = `date`; chomp($time);
+
+	    print OUT "Drive [$drive] with size [$drives->{$drive}]\n";
+	    print OUT "START: $time\n";
+
+	    my $test = `smartctl -a $drive -s on | grep self-assessment`;
+	    my $check = `smartctl -a $drive -s on | grep 'does not support'`;
+	    chomp($check);
+
+	    if ( $test =~ m/SMART overall-health self-assessment test result:\s*(\w*)/ || $check)
+	    {
+		if ($1 eq "PASSED" || $check)
+		{
+		    if ($check)
+		    {
+			&say("Drive $drive does not support SMART checks");
+		    }
+		    ## The Drive thinks it's healthy - let's prove it
+		    &command("badblocks -wvv -o $outputBadBlocks $drive");
+
+		    ## Bad Blocks will get spit to this output file and -S will show non-zero
+		    if (-s $outputBadBlocks)
+		    {
+			print OUT "Bad Blocks Found: $drive\n";
+		    }
+		    else
+		    {
+			print OUT "Drive [$drive] has passed all tests\n";
+		    }
+		}
+		else
+		{
+		    ## The Drive thinks it's unhealthy
+		    print OUT "Drive Failed Smart Controller Test\n";
+		}
+	    }
+	    else
+	    {
+		## The Drive thinks it's unhealthy
+		print OUT "Drive Failed Smart Controller Test\n";
+	    }
+
+	    my $time = `date`; chomp($time);
+	    print OUT "END: $time\n";
+	    close(OUT);
+	    exit(0);
+	}
+    }
+
+## Wait till all kids are done
+
+    my $isDone = undef;
+
+    while(!$isDone)
+    {
+	$isDone = 1;
+	$notDone = "";
+	foreach my $child (@children)
+	{
+	    my $cmd = "ps auxw | grep $child | grep $0 | grep -v grep";
+	    my $check = `$cmd`;
+	    chomp($check);
+	    if ($check ne "")
+	    {
+		$isDone = undef;
+		$notDone .= " $child";
+	    }
+	}
+
+	if (!$isDone)
+	{
+	    my $time = `date`;
+	    chomp($time);
+	    &say("[$time] - Drive Burn still running: Processes[$notDone ]");
+	}
+
+	sleep(1);
+    }
+
+    my $time = `date`;
+    chomp($time);
+    &say("[$time] - Emailing Results - Process Complete!!!!!");
+
+    &outputStatus();
+}
+
+sub outputStatus()
+{
+
+    ## Put the IP since Chase's machine wasn't resolving correctly
+    my $smtp = Net::SMTP->new('192.168.0.17');
+
+    $smtp->mail('driveburner@bpok.com');
+    $smtp->to('internalsupport@bpok.com');
+    $smtp->data();
+    $smtp->datasend("To: internalsupport\@bpok.com\n");
+    $smtp->datasend("Subject: Drive Burning is Complete\n");
+    $smtp->datasend("Priority: Urgent\n");
+    $smtp->datasend("\n\n");
+    $smtp->datasend("------------------------------------------------------------------------------\n");
+
+    my @files = `ls /tmp/\*.output`;
+
+    foreach my $file (@files)
+    {
+
+	chomp($file);
+	open(IN,"<$file");
+	@lines = <IN>;
+	close(IN);
+
+
+	foreach my $line (@lines)
+	{
+	    $smtp->datasend($line);
+	}
+
+	$smtp->datasend("------------------------------------------------------------------------------\n");
+
+    }
+
+    $smtp->datasend();
+    $smtp->quit();
+}
+
+sub initialize()
+{
+    my $cmd = undef;
+
+    if ($< != 0)
+    {
+	&hError("You must be root to run this script!");
+    }
+
+    if ($ARGV[0] !~ /-r/)
+    {
+	&hError("You did not specify -r to run");
+    }
+
+    print "ARE YOU ABSOLUTELY SURE YOU WANT TO RUN THIS COMMAND: [y|N]";
+    $input = <STDIN>;
+    if ($input !~ /y/i)
+    {
+	&hError("Did not get clearance to run");
+    }
+
+    print "ARE YOU ABSOLUTELY SURE YOU WANT TO RUN THIS COMMAND: [y|N]";
+    $input = <STDIN>;
+    if ($input !~ /y/i)
+    {
+	&hError("Did not get clearance to run");
+    }
+
+    print "THIS WILL DELETE ALL THE DRIVES ON THIS MACHINE - ARE YOU ABSOLUTELY SURE YOU WANT TO RUN THIS COMMAND: [y|N]";
+    $input = <STDIN>;
+    if ($input !~ /y/i)
+    {
+	&hError("Did not get clearance to run");
+    }
+
+    ## Clear DMESG
+    &command("dmesg -c");
+}
+
+sub getDrives()
+{
+    my $drives = {};
+    my @lines = `fdisk -l 2> /dev/null`;
+    my $lastDrive = undef;
+
+    foreach my $line (@lines)
+    {
+	chomp($line);
+
+	if ( $line =~ m/.*(\/dev.*?sd[a-p]):\s*\d*.\d*\s*\w*,\s*(\d*)?/ ) 
+	{
+	    my $drv = $1;
+	    my $size = $2;
+
+	    &say("Drive [$drv] - Size [$size]");
+	    $drives->{$drv} = $size;
+	    $lastDrive = $drv;
+
+	}
+
+	if ( $line =~ m/.*device.*boot.*start.*/i)
+	{
+	    print "Drive [$lastDrive] appears to have a partition - It could be the OS Drive.  Would you like to skip?  [Y/n]";
+	    $input = <STDIN>;
+	    if ($input !~ /n/i)
+	    {
+		delete $drives->{$lastDrive};
+		print "Skipping $lastDrive...\n";
+	    }
+	}
+
+
+    }
+
+    return $drives;
+}
+
+sub zombieKiller
+{
+    my $pid;
+    while ( ( $pid = waitpid( -1, &WNOHANG ) ) > 0 )
+    {
+	if ($pid == -1)
+	{
+	    ## Do nothing
+	}
+	elsif ( WIFEXITED($?) )
+	{
+	    ## If we were keeping track we'd fart with it here.. but we don't care.. just wanna reap 'em
+	}
+    }
+    $SIG{CHLD} = \&zombieKiller;
+}
+
+
+## Run a system command
+sub command()
+{
+    my $cmd = shift;
+
+    &debug(11,"Command: $cmd");
+
+    system($cmd . " 2> /dev/null 1> /dev/null");
+}
+
+
+
+&main();
+exit(0);

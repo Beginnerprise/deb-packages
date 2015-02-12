@@ -1,0 +1,6 @@
+Package: bp-phone-tools
+Version: 0.2
+Architecture: all
+Depends: bp-perl-modules, libmime-tools-perl
+Maintainer: Software Engineering <engineering@beginnerprise.com>
+Description: Asterisk Phone Switch scripts

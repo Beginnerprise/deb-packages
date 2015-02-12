@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# Only take action on hard service states...
+case "$2" in
+HARD)
+	case "$1" in
+	CRITICAL)
+		# We can't ping google.com so lets assume we don't have net.
+		# Lets disable notifications so we don't get flooded.
+		/usr/local/nagios/libexec/eventhandlers/disable_notifications
+		;;
+	WARNING)
+	        # Could be a fluke, so we do nothing.
+	        ;;
+	UNKNOWN)
+		# Still, could be a fluke, so we do nothing.
+		;;
+	OK)
+		# Ok, looks like we have net again so lets enable the notifications.
+		/usr/local/nagios/libexec/eventhandlers/enable_notifications
+		;;
+	esac
+	;;
+esac
+exit 0

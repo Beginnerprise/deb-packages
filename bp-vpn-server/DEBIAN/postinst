@@ -1,0 +1,25 @@
+#!/usr/bin/perl
+
+
+if ($ARGV[0] eq "configure")
+{
+    my @commands = ();
+
+    push(@commands,'a2ensite vpn.beginnerprise.com');
+    push(@commands,'a2ensite vpn.beginnerprise.com-ssl');
+    push(@commands,'service apache2 restart');
+
+    foreach my $command (@commands)
+    {
+	system($command);
+    }
+
+    print <<"    EOF";
+
+    You may be required to setup the SSL certificates for this machine if this is the first
+    time setting up the VPN on a server.
+
+    See the ssl config here:  /etc/apache2/sites-available/vpn.beginnerprise.com-ssl
+
+    EOF
+}

@@ -1,0 +1,27 @@
+#! /usr/bin/perl
+
+#####################################################################################################
+# Author:	Benjamin Hudgens
+# Date:		Semptember 16, 2013
+#
+# Description:
+#		Very quick script that allows you to clean up your perl in
+#		vi.  Type [:% !tidy] in VIM to use (when this is installed)
+#####################################################################################################
+
+use warnings;
+use Perl::Tidy;
+
+my $input_string  = "";
+my $output_string = "";
+my $options       = '-bl -l=150';
+
+while (<STDIN>)
+{
+    $input_string .= $_;
+}
+
+Perl::Tidy::perltidy( source => \$input_string, destination => \$output_string, argv => \$options, );
+
+chomp $output_string;
+print STDOUT $output_string;

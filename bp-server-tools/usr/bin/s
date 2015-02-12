@@ -1,0 +1,320 @@
+#! /usr/bin/perl
+
+use POSIX qw(:sys_wait_h setsid);
+use Term::ReadKey;
+
+######################################################################################################
+##
+## Author:  	Benjamin Hudgens
+## Date:	February 3, 2006
+## Modified:	June 3, 2011 - Ported functionality to support Mac & Linux
+##		
+## Description:
+##		Automatically build key files and install them on a destination server
+##		(This is a quick hack job)
+##
+######################################################################################################
+
+######################################################################################################
+## Globals and configs
+######################################################################################################
+my $whoami			= `whoami`;
+chomp($whoami);
+
+my $homedir		= (getpwnam($whoami))[7];
+my $password		= '';
+my $host		= '';
+my $install_dir		= '/usr/bin';
+my $doneHostsFile 	= "$homedir/.ssh/keyd_hosts";
+my $rsa_key_file	= "id_rsa.pub";
+my $dsa_key_file	= "id_dsa.pub";
+my $rsa_pub_key		= "$homedir/.ssh/$rsa_key_file";
+my $dsa_pub_key		= "$homedir/.ssh/$dsa_key_file";
+my $authorized_key_file	= "authorized_keys";
+my $authorized_keys	= "$homedir/.ssh/$authorized_key_file";
+my $debug		= undef;
+
+
+######################################################################################################
+## Main
+######################################################################################################
+#sub main 
+#{
+
+## Find our script name
+    my $me = $0;
+    my $cleanPathReg = '[\.|\w|\d|\/]*\/';
+
+    $me =~ s/$cleanPathReg//;    
+
+## Conveniently install ourselves into a location in the PATH (default: /usr/bin)
+    debug(5,"Checking to see if $install_dir/$me exists");
+    if (!-f "$install_dir/$me") { 
+
+	installer();
+	exit(0);
+
+    } else {
+
+	debug(5,"Comparing $0 $install_dir/$me:");
+	$check = `diff $0 $install_dir/$me`;
+	chomp($check);
+	if ($check ne "") { installer(); exit(0) };
+
+    }
+
+## This catches a call back from a fork to accomodate OpenSSH's hacky passing password poo
+    if (  exists $ENV{SSHPASS} 
+	    && exists $ENV{SSH_ASKPASS}
+	    && $ENV{SSH_ASKPASS} eq "$install_dir/$me"
+	    && @ARGV > 0
+	    && ! -t 1) {
+
+	handle_ssh_call();
+	exit(0);
+
+    } else {
+## Make sure they supplied a hostname
+	if (@ARGV > 0) { $host = $ARGV[0] } else { error("Must Supply a host: $0 <host>") };
+    }
+
+## Make our rsa and dsa key files if we've never done it
+    if (!-f $rsa_pub_key) { make_rsa() };
+    if (!-f $dsa_pub_key) { make_dsa() };
+    if (!-f $doneHostsFile) { 
+	`touch $doneHostsFile`;
+	say("Initializing history File for First Run");
+    }
+
+## If we are called for a host that we've already keyed.. don't do it again and create clutter
+    open(HOSTS,"<$doneHostsFile");
+    @hosts = <HOSTS>;
+    close(HOSTS);
+
+    $count = @hosts;
+
+    if ($count > 0) {
+
+	foreach my $chkhost (@hosts) {
+
+	    chomp($chkhost);
+	    if ($chkhost eq $host) {
+
+## We've already keyed this host - let's just ssh to it.
+		debug(7,"Making ssh connection to: $host");
+		ssh($host);
+		exit(0);
+
+	    }
+
+	}
+
+    } 
+
+## Oh, well, we need to key this host - since we have to fork for openssh - we'll have to be called again to ssh there
+    say("Looks like I haven't tried to login to $host before");
+    say("");
+    say("Please provide the password to $host so it can be configured");
+    say("");
+    ask_for_password();
+    send_pub_key();
+
+## Whew.. all done
+
+#}
+
+######################################################################################################
+## Methods and Helpers
+######################################################################################################
+
+sub installer {
+
+    say("I am not correctly installed.  Would you like me to install now?  (y/n)");
+    $ans = <STDIN>;
+    if ($ans =~ /n/i) { error("Not installed") };
+    `mv $0 $install_dir  &> /dev/null`;
+
+}
+
+sub say {
+
+    my $msg = shift;
+    print "$msg\n";
+    return();
+
+}
+
+sub handle_ssh_call {
+
+    if ($ARGV[0] =~ m/yes\/no/o) { 
+        debug(5,"Saying yes to adding host fingerprint");
+        print "yes\n";
+	exit(0);
+    }
+
+    debug(10,"Trying password: $ENV{SSHPASS}");
+    print $ENV{SSHPASS};
+
+}
+
+sub send_pub_key {
+
+    $pid = fork;
+
+    if ($pid == 0) {
+
+	setsid();
+        $ENV{DISPLAY} = 'none.';
+        $ENV{SSH_ASKPASS} = "$install_dir/$me";
+        $ENV{SSHPASS} = "$password";
+
+	&debug(10,"PASSWORD: $ENV{SSHPASS}");
+
+	my $cmd 	= undef;
+
+        $cmd	= "ssh $host mkdir -p .ssh";
+	&debug(10,"C: $cmd");
+	system($cmd);
+
+	$cmd 	= "scp $rsa_pub_key $host:~/.ssh/$rsa_key_file.new";
+	&debug(10,"C: $cmd");
+	system($cmd);
+
+	$cmd	= "scp $dsa_pub_key $host:~/.ssh/$dsa_key_file.new";
+	&debug(10,"C: $cmd");
+	system($cmd);
+	
+	$cmd	= "ssh $host 'cat ~/.ssh/$dsa_key_file.new >> ~/.ssh/$authorized_key_file'";
+	&debug(10,"C: $cmd");
+	system($cmd);
+
+	$cmd	= "ssh $host 'cat ~/.ssh/$rsa_key_file.new >> ~/.ssh/$authorized_key_file'";
+	&debug(10,"C: $cmd");
+	system($cmd);
+
+        $check 	= `ssh $host 'ls ~/.ssh/$dsa_key_file.new'`;
+        chomp($check);
+	debug(10,"Did it work?  Result of check: $check");
+        if ($check =~ /$dsa_key_file\.new/) {
+
+	    $cmd	= "ssh $host 'rm ~/.ssh/$rsa_key_file.new'";
+	    &debug(10,"C: $cmd");
+	    system($cmd);
+
+	    $cmd	= "ssh $host 'rm ~/.ssh/$dsa_key_file.new'";
+	    &debug(10,"C: $cmd");
+	    system($cmd);
+
+	    debug(10,"Adding $host to $doneHostsFile");
+            `echo $host >> $doneHostsFile`;
+            say("SSH now configured for $host");
+            say("Please try again");
+        } else {
+	    error("SSH Failed after setup; bad password maybe?");
+	}
+    } else { 
+        return()
+    }
+
+
+}
+
+sub ask_for_password {
+
+    print "Password: ";
+    ReadMode 'noecho';
+    $password = <STDIN>;
+    chomp($password);
+    ReadMode 'normal';
+    print "\n";
+    debug(10,"Password = $password");
+
+    #$fd_stdin = fileno(STDIN);
+    #$term = POSIX::Termios->new();
+    #$term->getattr($fd_stdin);
+
+    #$oterm = $term->getlflag();
+
+    #$echo     = ECHO | ECHOK | ICANON;
+    #$noecho   = $oterm & ~$echo;
+
+    #$term->setlflag($noecho);
+    #$term->setcc(VTIME,1);
+    #$term->setattr($fd_stdin, TCSANOW);
+    
+    
+    #$term->setlflag($oterm);
+    #$term->setcc(VTIME,0);
+    #$term->setattr($fd_stdin, TCSANOW);
+    
+}
+
+sub debug {
+
+    my $lvl = shift;
+    my $msg = shift;
+    if ($debug >= $lvl) { print STDERR "DEBUG[$lvl]: $msg\n" };
+    return();
+
+}
+
+sub make_dsa {
+
+    use Expect;
+    say("No DSA Key found on local host");
+    say("Creating DSA key file");
+
+    my $expect		= undef;
+    my $match		= undef;
+
+    $expect		= Expect->spawn("ssh-keygen -b 1024 -t dsa");
+    $match		= $expect->expect(10,"):");
+    print $expect	"\n";
+    $match		= $expect->expect(10,"):");
+    print $expect	"\n";
+    $match		= $expect->expect(10,"n:");
+    print $expect	"\n";
+    $match		= $expect->expect(10);
+
+    if (!-f $dsa_pub_key) { error("Couldn't Make the DSA PUB KEY") };
+}
+
+sub make_rsa {
+
+    use Expect;
+    say("No RSA Key found on local host");
+    say("Creating RSA key file");
+
+    my $expect		= undef;
+    my $match		= undef;
+
+    $expect		= Expect->spawn("ssh-keygen -b 1024 -t rsa");
+    $match		= $expect->expect(10,"):");
+    print $expect	"\n";
+    $match		= $expect->expect(10,"):");
+    print $expect	"\n";
+    $match		= $expect->expect(10,"n:");
+    print $expect	"\n";
+    $match		= $expect->expect(10);
+
+    if (!-f $rsa_pub_key) { error("Couldn't Make the RSA PUB KEY") };
+}
+
+sub error {
+
+    $msg = shift;
+    print STDERR "ERROR:  $msg\n";
+    exit(1);
+
+}
+
+sub ssh {
+
+    $host = shift;
+    debug(3,"Attempting to SSH to $host");
+    system("ssh $host");
+
+}
+
+#&main();
+exit(0);

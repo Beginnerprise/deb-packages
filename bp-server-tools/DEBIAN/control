@@ -1,0 +1,6 @@
+Package: bp-server-tools
+Version: $Revision: 211 $
+Architecture: all
+Depends: libterm-readkey-perl,perltidy,libexpect-perl,smartmontools
+Maintainer: Internal Support <internalsupport@bpok.com>
+Description: Common useful tools for Beginnerprise Solutions

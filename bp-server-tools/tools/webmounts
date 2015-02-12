@@ -1,0 +1,84 @@
+#! /usr/bin/perl
+### BEGIN INIT INFO
+# Provides:	      webmounts
+# Required-Start:    $local_fs $remote_fs $network $syslog $named
+# Required-Stop:     $local_fs $remote_fs $network $syslog $named
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# X-Interactive:     true
+# Short-Description: Start/stop apache2 web server
+### END INIT INFO
+
+my $pathMachineMounts = '/mnt/machines';
+my $username = 'www-data';
+my $password = 'www-data';
+
+my @machines	= (
+    'store1.bp.local'
+);
+
+# Make all the mount points
+foreach my $machine (@machines)
+{
+    my $mount = "$pathMachineMounts/$machine";
+    if (!-d $mount)
+    {
+	my $cmd = "mkdir -p $mount";
+	system($cmd);
+    }
+
+    if (!-d $mount)
+    {
+	print "Error: Couldn't create mount dir [$mount]\n";
+	exit(1);
+    }
+
+    # Get all the mounts
+    my @lines = `smbclient -L $machine -U $username%$password`;
+
+    foreach my $line (@lines)
+    {
+	chomp($line);
+	if ($line =~ /\s*(\w+).*Disk.*/)
+	{
+	    my $mountOnServer = $1;
+	    my $newMount = "$mount/$mountOnServer";
+	    if (!-d $newMount)
+	    {
+		my $cmd = "mkdir -p $newMount";
+		system($cmd);
+		if (!-d $newMount)
+		{
+		    print "Error: Couldn't create mount dir [$newMount]\n";
+		    exit(1);
+		}
+	    }
+
+	    my $cmd = "";
+	    $cmd .= " mount -t cifs -o username='$username',password='$password',forcedirectio ";
+	    $cmd .= " //$machine/$mountOnServer ";
+	    $cmd .= " $newMount ";
+
+	    system($cmd);
+
+	}
+    }
+
+}
+
+## For now this isn't very dynamic because the root share is all of private or public.  
+## Eventually we should nest these down into buckets and handle that
+
+my $cmd = "";
+
+$cmd = "ln -s /mnt/machines/store1.bp.local/hd1 /mnt/links/public";
+system($cmd);
+$cmd = "ln -s /mnt/machines/store1.bp.local/hd2 /mnt/links/private";
+system($cmd);
+$cmd = "ln -s /mnt/machines/store1.bp.local/hd3 /mnt/links/tmp";
+system($cmd);
+$cmd = "ln -s /mnt/links/public /var/www/oms.wegolook.com/sites/default/files";
+system($cmd);
+
+
+

@@ -1,0 +1,22 @@
+#! /bin/bash
+
+PROGNAME=`basename $0`
+PROGPATH=`echo $0 | sed -e 's,[\\/][^\\/][^\\/]*$,,'`
+
+. '/usr/lib/nagios/plugins/utils.sh'
+
+if [ "$1" = "" ]
+then
+	echo -e " Use : $PROGNAME <file_name> -- Ex : $PROGNAME /etc/hosts \n "
+	exit $STATE_UNKNOWN
+fi
+
+
+if [ -f $1 ]
+then
+	echo "File [$1] Exists"
+	exit $STATE_CRITICAL
+else
+	echo "File [$1] Does Not Exists"
+	exit $STATE_OK
+fi

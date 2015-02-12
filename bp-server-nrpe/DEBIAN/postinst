@@ -1,0 +1,29 @@
+#! /usr/bin/perl
+
+
+if ($ARGV[0] =~ /configure/i)
+{
+    push(@commands,'mv /etc/nagios/nrpe_local.cfg.bp /etc/nagios/nrpe_local.cfg');
+    push(@commands,'service nagios-nrpe-server restart');
+
+    &runCommands(\@commands); 
+}
+
+if (-f '/usr/bin/mysql')
+{
+    push(@commands,'mysql -e"CREATE USER "nagios""');
+    #push(@commands,'mysql -e"SET PASSWORD FOR "nagios" = Password1"'); 
+    push(@commands,'mysql -e"GRANT SELECT ON *.* TO "nagios""');
+
+    &runCommands(\@commands);
+}
+
+sub runCommands
+{
+    my $commands = shift;
+    foreach my $command (@$commands)
+    {
+	system($command);
+    }
+}
+

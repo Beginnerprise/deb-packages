@@ -6,7 +6,7 @@
 # Required-Stop:     $network $local_fs $remote_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: Runs the Smith Roberts mirror manager
+# Short-Description: Runs the Beginnerprise mirror manager
 ### END INIT INFO
 
 
@@ -55,11 +55,11 @@ my @dirsToCreateOnNewDrives	= (
 				  );
 
 
-$SIG{ALRM}			= sub { 
-    					print "Timeout!\n"; 
+$SIG{ALRM}			= sub {
+    					print "Timeout!\n";
 					&mountConfiguredDrives();
 					&enableRsyncs();
-					exit(0) 
+					exit(0)
 				      };
 
 sub main
@@ -187,7 +187,7 @@ sub mountConfiguredDrives
 	{
 	    &pi("Failed\n");
 	    $isFailed		= 1;
-	} 
+	}
 	else
 	{
 	    &pi("Success\n");
@@ -257,7 +257,7 @@ sub configureNewDrives
 
     if (&askYN("Setup your new hard drive?"))
     {
-    	my @newDrives		= &scanForNewDrives(); 
+    	my @newDrives		= &scanForNewDrives();
 	foreach my $drive (@newDrives)
 	{
 	    $swapSize = &scanForSwapSize();
@@ -441,7 +441,7 @@ sub configureNewDrives
 		{
 		    print "Failed\n";
 		    exit(1);
-		} 
+		}
 		else
 		{
 		    print "Done\n";
@@ -497,7 +497,7 @@ sub configureNewDrives
 		&debug(1,"Exiting");
 		exit(1);
 	    }
-	    
+
 
 	}
     }
@@ -613,7 +613,7 @@ sub configureGrub
 
     my $cmd 	= undef;
     $cmd	.= "mount --bind /dev $destTemp/dev; ";
-    $cmd 	.= "mount --bind /proc $destTemp/proc; "; 
+    $cmd 	.= "mount --bind /proc $destTemp/proc; ";
     $cmd	.= "mount --bind /sys $destTemp/sys; ";
     $cmd	.= "chroot $destTemp update-grub; ";
     $cmd	.= "chroot $destTemp grub-install $device; ";
@@ -634,7 +634,7 @@ sub configureGrub
 sub scanForSwapSize
 {
 
-    if (!-f $STATIC_MEM_INFO) 
+    if (!-f $STATIC_MEM_INFO)
     {
 	&hError("Can't find $STATIC_MEM_INFO");
     }
@@ -689,7 +689,7 @@ sub scanForNewDrives
 		last;
 	    }
 	}
-	
+
 	if (!$found)
 	{
 	    push(@newDrives,$drive);

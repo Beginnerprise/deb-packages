@@ -1,0 +1,66 @@
+#!/bin/bash
+
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/bin/X11"
+
+LIBEXEC="/usr/local/nagios/libexec"
+. $LIBEXEC/utils.sh
+
+print_usage() {
+	echo "Usage: $PROGNAME"
+	echo "Usage: $PROGNAME --help"
+}
+
+print_help() {
+	echo ""
+	print_usage
+	echo ""
+	echo "Clamd monitor plugin for Nagios"
+	echo ""
+	echo "This plugin not developped by the Nagios Plugin group."
+	echo "Please do not e-mail them for support on this plugin, since"
+	echo "they won't know what you're talking about :P"
+	echo ""
+	echo "For contact info, read the plugin itself..."
+}
+
+while test -n "$1" 
+do
+	case "$1" in
+	  --help) print_help; exit $STATE_OK;;
+	  -h) print_help; exit $STATE_OK;;
+	  *) print_usage; exit $STATE_UNKNOWN;;
+	esac
+done
+
+check_processes()
+{
+	PROCESS="0"
+        PROCLIST="clamd"
+
+	for PROC in `echo $PROCLIST`; do
+	if [ `ps -ef | grep $PROC | grep -v grep | wc -l` -lt 1 ]; then 
+		if [ $PROC == "smtpd" ]; then
+			if [ `ps -ef | grep proxymap | grep -v grep | wc -l` -lt 1 ]; then
+				PROCESS=1
+			else
+				PROCESS=0
+			fi
+		else
+			PROCESS=1
+		fi
+	fi
+	done
+
+	if [ $PROCESS -eq 1 ]; then 
+		echo "Clamd NOT OK - The process is not running"
+		exitstatus=$STATE_CRITICAL
+		exit $exitstatus
+	fi
+}
+
+
+check_processes
+
+echo "Clamd OK - Everything running like it should"
+exitstatus=$STATE_OK
+exit $exitstatus
