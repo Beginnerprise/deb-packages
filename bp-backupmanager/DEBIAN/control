@@ -1,0 +1,8 @@
+Package: bp-backupmanager
+Version: 1.2
+Architecture: all
+Depends: bp-perl-modules (>= 1.1),rsync,cifs-utils
+Maintainer: Information Technology <bhudgens@beginnerprise.com>
+Description: Beginnerprise Backup Server Manager
+   Backup server for Beginnerprise Solutions
+

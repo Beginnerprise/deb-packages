@@ -1,0 +1,1567 @@
+#! /usr/bin/perl
+
+#############################################################################
+##
+##  Author:  	Benjamin Hudgens
+##  Date:  	April 22, 2009
+##  Modified:	May 12, 2012 - Adding threaded support
+##
+##  Description:  Process what needs to happen for backups and
+##		          kick off any new backups necessary
+##
+#############################################################################
+
+use Beginnerprise::Standard;
+use POSIX ":sys_wait_h";
+use IO::Socket;
+use IO::Select;
+use Time::HiRes qw( usleep );
+
+$SIG{TERM} = \&shutdown;
+$SIG{CHLD} = \&zombieKiller;
+
+#############################################################################
+## Global Variables
+#############################################################################
+
+my $config                      = {};
+my $state                       = {};
+my $configDir                   = '/etc/beginnerprise';
+my $configFile                  = $configDir . '/bp-backupmanager.conf';    # Default config file
+my $maxChildren                 = 8;                                              # Default max children
+my $maxOffsites                 = 3;
+my $maxOnsites                  = 5;
+my $runningChildren             = 0;
+my $runningOnsites              = 0;
+my $runningOffsites             = 0;
+my $statusPort			        = 5000;
+my $requeueSeconds		        = 1800;					# Always requeue onsites during offsites
+my $mountLock			        = '/tmp/mountlock';
+my $stopBackupsFile             = '/tmp/stopbackups';                             # Default Stop Backups File
+my $socket                      = undef;                                          # The socket we open for status updates
+my $select                      = undef;                                          # The select we use to check the socket
+my $isSafeToDeleteStaleOffsites = undef;                                          # Flag set for deleting offsites
+
+#############################################################################
+## Main Code
+#############################################################################
+
+sub main
+{
+
+    &initialize();
+
+    my $count = @{ $config->{'servers'} };
+
+    my $isDone = undef;
+
+
+    # BH - Thread the backups so we can run more than one at a time 5/12/2012
+    while (!$isDone)    # Loop forever until all backups are run
+    {
+
+        &doProcessSocket();    # Check if anyone is asking for our status
+
+
+        for ( my $c = 0 ; $c < $count ; $c++ )
+        {
+            my $name        = $config->{'servers'}[$c]->{'name'}[0];
+            my $id          = $config->{'servers'}[$c]->{'id'}[0];
+            my $path        = $config->{'servers'}[$c]->{'path'}[0];
+            my $un          = $config->{'servers'}[$c]->{'username'}[0];
+            my $pw          = $config->{'servers'}[$c]->{'password'}[0];
+            my $type        = $config->{'servers'}[$c]->{'type'}[0];
+            my $mntDest     = "$config->{'static'}[0]->{'DIR_MOUNTS'}[0]/$id";
+            my $archiveDest = "$config->{'static'}[0]->{'DIR_ARCHIVES'}[0]/$id";
+            my $offsiteDest = "$config->{'static'}[0]->{'DIR_OFFSITES'}[0]/$id";
+
+            if ( $runningChildren >= $maxChildren )
+            {
+                &debug( 3, "Max Children running - Current: $runningChildren Max: $maxChildren" );
+                last;               # We have too many kids running so we're gonna wait to start more
+            }
+
+            ## Adding the ability to shut down mid backups without killing the current backup.
+            if ( -f $stopBackupsFile )
+            {
+                if ( $runningChildren > 0 )
+                {
+                    &debug( 4, "Stop file exists [$stopBackupsFile]" );
+                    &debug( 4, "Waiting for kids [$runningChildren] then exiting..." );
+                    last;
+                }
+                else
+                {
+                    &debug( 4, "Stop file exists [$stopBackupsFile]" );
+                    &debug( 4, "No kids [$runningChildren] so exiting..." );
+                    last;
+                }
+
+            }
+
+            if ( !$config->{'servers'}[$c]->{'onsiteRunning'} )
+            {
+
+                if ( $runningOnsites < $maxOnsites )
+                {
+                    my $pid = fork();
+
+                    if ( !defined($pid) )
+                    {
+                        &sError("Couldn't fork for $config->{'servers'}[$c]->{'name'}[0]");    # We couldn't fork?
+                        next;
+                    }
+                    elsif ( $pid == 0 )
+                    {
+			$? = 0;
+                        &startOnsite($c);    # Start offsite
+                        exit(1);             # Our kid should exit with the proper status, if we get here.. there was an error
+                    }
+                    else
+                    {
+                        my $startTime    = `date`;
+                        my $startSeconds = `date +%s`;
+                        chomp($startTime);
+                        chomp($startSeconds);
+                        $config->{'servers'}[$c]->{'onsiteRunning'}      = $pid;
+                        $config->{'servers'}[$c]->{'onsiteStartTime'}    = $startTime;
+                        $config->{'servers'}[$c]->{'onsiteStartSeconds'} = $startSeconds;
+                        $runningChildren++;
+                        $runningOnsites++;
+                        &debug( 4, "Started onsite for [$name] with pid [$pid]" );
+                    }
+                }
+                else
+                {
+                    &debug( 4, "Max Onsites running - Current: $runningOnsites - Max: $maxOnsites" );
+                }
+            }
+            elsif ( $config->{'servers'}[$c]->{'enableOffsite'}[0] )
+            {
+                if ( $config->{'servers'}[$c]->{'onsiteEndTime'} )    # if this onsite is done, start the offsite
+                {
+                    if ( $runningOffsites < $maxOffsites )
+                    {
+                        if ( !$config->{'servers'}[$c]->{'offsiteRunning'} )
+                        {
+
+                            my $pid = fork();
+
+                            if ( !defined($pid) )
+                            {
+                                &sError("Couldn't fork for $config->{'servers'}[$c]->{'name'}[0]");    # We couldn't fork?
+                                next;
+                            }
+                            elsif ( $pid == 0 )
+                            {
+				$? = 0;
+                                &startOffsite($c);    # Start offsite
+                                exit(1);              # Our kid should exit with the proper status, if we get here.. there was an error
+                            }
+                            else
+                            {
+                                my $startTime    = `date`;
+                                my $startSeconds = `date +%s`;
+                                chomp($startTime);
+                                chomp($startSeconds);
+                                $config->{'servers'}[$c]->{'offsiteRunning'}      = $pid;
+                                $config->{'servers'}[$c]->{'offsiteStartTime'}    = $startTime;
+                                $config->{'servers'}[$c]->{'offsiteStartSeconds'} = $startSeconds;
+                                $runningChildren++;
+                                $runningOffsites++;
+                                &debug( 4, "Started offsite for [$name] with pid [$pid]" );
+                            }
+                        }
+                    }
+                    else
+                    {
+                        &debug( 4, "Max Offsites running - Current: $runningOffsites - Max: $maxOffsites" );
+                    }
+                }
+            }
+
+        }
+
+	if ($runningOffsites > 0 && $runningOnsites == 0) # If we are just waiting for offsites to finish, try to run onsites again
+	{
+	    &doQueueOnsitesAgain();
+	}
+
+	if (-f $stopBackupsFile)  # If the stop file exists we are def finished
+	{
+	    $isDone = 1;
+	}
+	else
+	{
+	    if ($runningChildren == 0) # Otherwise, if all backups that should have an end time have it..
+	    {
+		$isDone = 1;
+		for ( my $c = 0 ; $c < $count ; $c++ )
+		{
+		    if(!$config->{'servers'}[$c]->{'onsiteEndTime'})
+		    {
+			print "All backups done but $config->{'servers'}[$c]->{'name'}[0] won't let me quit [onsite]...\n";
+			$isDone = undef;
+		    }
+		    if ($config->{'servers'}[$c]->{'enableOffsite'}[0])
+		    {
+			if(!$config->{'servers'}[$c]->{'offsiteEndTime'})
+			{
+			    print "All backups done but $config->{'servers'}[$c]->{'name'}[0] won't let me quit...\n";
+			    $isDone = undef;
+			}
+		    }
+		}
+	    }
+	}
+
+        if ( $opts->{'d'} ) # Slow down if we are in debug mode
+        {
+            usleep(1000000);
+        }
+        else
+        {
+            usleep(100000);
+        }
+    }
+
+    &doOutputJobStatus(); # Output the status of all jobs
+
+}
+
+sub doQueueOnsitesAgain
+{
+    my $count = @{ $config->{'servers'} };
+    my $time = `date`;
+    my $now = `date +%s`;
+    chomp($time);
+    chomp($now);
+
+    for ( my $c = 0 ; $c < $count ; $c++ )
+    {
+	my $name        = $config->{'servers'}[$c]->{'name'}[0];
+	my $id          = $config->{'servers'}[$c]->{'id'}[0];
+	my $path        = $config->{'servers'}[$c]->{'path'}[0];
+	my $un          = $config->{'servers'}[$c]->{'username'}[0];
+	my $pw          = $config->{'servers'}[$c]->{'password'}[0];
+	my $type        = $config->{'servers'}[$c]->{'type'}[0];
+	my $mntDest     = "$config->{'static'}[0]->{'DIR_MOUNTS'}[0]/$id";
+	my $archiveDest = "$config->{'static'}[0]->{'DIR_ARCHIVES'}[0]/$id";
+	my $offsiteDest = "$config->{'static'}[0]->{'DIR_OFFSITES'}[0]/$id";
+
+	if ( $config->{'servers'}[$c]->{'onsiteEndTime'} )
+	{
+	    # if offsite has been done for x seconds requeue onsites
+	    if (($now - $config->{'servers'}[$c]->{'onsiteEndSeconds'}) > $requeueSeconds)
+	    {
+		print STDOUT "Re-Queue: $name - $time\n";
+		$config->{'servers'}[$c]->{'onsiteRunning'} = undef;
+		$config->{'servers'}[$c]->{'onsiteEndTime'} = undef;
+		$config->{'servers'}[$c]->{'onsiteEndSeconds'} = undef;
+		$config->{'servers'}[$c]->{'onsiteStartTime'} = undef;
+		$config->{'servers'}[$c]->{'onsiteStartSeconds'} = undef;
+	    }
+	}
+    }
+}
+
+sub startOnsite
+{
+    my $c = shift;
+
+    my $name        = $config->{'servers'}[$c]->{'name'}[0];
+    my $id          = $config->{'servers'}[$c]->{'id'}[0];
+    my $path        = $config->{'servers'}[$c]->{'path'}[0];
+    my $un          = $config->{'servers'}[$c]->{'username'}[0];
+    my $pw          = $config->{'servers'}[$c]->{'password'}[0];
+    my $type        = $config->{'servers'}[$c]->{'type'}[0];
+    my $mntDest     = "$config->{'static'}[0]->{'DIR_MOUNTS'}[0]/$id";
+    my $archiveDest = "$config->{'static'}[0]->{'DIR_ARCHIVES'}[0]/$id";
+    my $offsiteDest = "$config->{'static'}[0]->{'DIR_OFFSITES'}[0]/$id";
+    my $logFile     = "$config->{'static'}[0]->{'DIR_LOGS'}[0]/backups_onsite_$name.txt";
+
+    my $CMD_RSYNC = $state->{'CMD_RSYNC'}[0];
+
+    $type = lc($type);
+
+    &debug( 13, "Server [$c] is of type [$type]" );
+
+    if ( $type ne "cifs" && $type ne "ssh" )
+    {
+        &sError("Type not specified for this server...skipping");
+        exit(1);
+    }
+
+    if ( $type eq "cifs" )
+    {
+	open(OUT,">>$mountLock");
+	flock(OUT,2);
+        &getServerMounted( $path, $mntDest, $un, $pw );
+	close(OUT);
+        if (&getErrorStatus)
+        {
+            exit(1);
+        }
+    }
+
+    ## Handle the archive sync and log rotations
+
+    if ( !-d $archiveDest ) # If our archive destination doesn't exist, create it
+    {
+        my $cmd = "mkdir -p $archiveDest";
+        &debug( 19, "CMD: $cmd" );
+        system($cmd);
+        if ( !-d $archiveDest )
+        {
+            &hError("Failed to create $archiveDest");
+        }
+    }
+
+    my $now = `date +%Y%m%d%H%M%S`;
+    chomp($now);
+
+    my $archiveFinal = undef;
+    my $chk          = undef;
+
+    my @archiveList = `ls -d $archiveDest/*`; # Get a list of all backups
+    my @hourly      = `ls -d $archiveDest/*.hourly`; # Get a list of each type
+    my @daily       = `ls -d $archiveDest/*.daily`;
+    my @weekly      = `ls -d $archiveDest/*.weekly`;
+    my @monthly     = `ls -d $archiveDest/*.monthly`;
+
+    $chk = undef;
+    &debug( 13, "Checking if sync should be hourly" );
+    foreach my $archive (@hourly)
+    {
+
+        if ($chk) { last }
+
+        my $date = undef;
+
+        $archive =~ m/$archiveDest\/(\d+)\.\w+/;
+        my $date = $1;
+
+        my $tmpSecs = &expandDateStamp($date);
+        $tmpSecs = `date -d '$tmpSecs' +%s`;
+        chomp($tmpSecs);
+
+        my $tmpNow = &expandDateStamp($now);
+        $tmpNow = `date -d '$tmpNow' +%s`;
+        chomp($tmpNow);
+
+        my $diff = $tmpNow - $tmpSecs;
+
+        if ( $diff < 3590 )
+        {
+            &debug( 14, "Archive taken within day: $archive" );
+            $chk = 1;
+        }
+
+    }
+
+    if ( !$chk )
+    {
+        $archiveFinal = "hourly";
+        &debug( 14, "Setting archive to: $archiveFinal" );
+    }
+
+    $chk = undef;
+    &debug( 13, "Checking if sync should be daily" );
+    foreach my $archive (@daily)
+    {
+
+        if ($chk) { last }
+
+        my $date = undef;
+
+        $archive =~ m/$archiveDest\/(\d+)\.\w+/;
+        my $date = $1;
+
+        my $tmpSecs = &expandDateStamp($date);
+        $tmpSecs = `date -d '$tmpSecs' +%s`;
+        chomp($tmpSecs);
+
+        my $tmpNow = &expandDateStamp($now);
+        $tmpNow = `date -d '$tmpNow' +%s`;
+        chomp($tmpNow);
+
+        my $diff = $tmpNow - $tmpSecs;
+
+        if ( $diff < 86399 )
+        {
+            &debug( 14, "Archive taken within day: $archive" );
+            $chk = 1;
+        }
+
+    }
+
+    if ( !$chk )
+    {
+        $archiveFinal = "daily";
+        &debug( 14, "Setting archive to: $archiveFinal" );
+    }
+
+    $chk = undef;
+    &debug( 13, "Checking if sync should be weekly" );
+    foreach my $archive (@weekly)
+    {
+        if ($chk) { last }
+
+        my $date = undef;
+
+        $archive =~ m/$archiveDest\/(\d+)\.\w+/;
+        my $date = $1;
+
+        my $tmpSecs = &expandDateStamp($date);
+        $tmpSecs = `date -d '$tmpSecs' +%s`;
+        chomp($tmpSecs);
+
+        my $tmpNow = &expandDateStamp($now);
+        $tmpNow = `date -d '$tmpNow' +%s`;
+        chomp($tmpNow);
+
+        my $diff = $tmpNow - $tmpSecs;
+
+        if ( $diff < 604800 )
+        {
+            &debug( 14, "Archive taken within week: $archive" );
+            $chk = 1;
+        }
+
+    }
+
+    if ( !$chk )
+    {
+        $archiveFinal = "weekly";
+        &debug( 14, "Setting archive to: $archiveFinal" );
+    }
+
+    $chk = undef;
+    &debug( 13, "Checking if sync should be monthly" );
+    foreach my $archive (@monthly)
+    {
+        if ($chk) { last }
+
+        my $date = undef;
+
+        $archive =~ m/$archiveDest\/(\d+)\.\w+/;
+        my $date = $1;
+
+        my $tmpSecs = &expandDateStamp($date);
+        $tmpSecs = `date -d '$tmpSecs' +%s`;
+        chomp($tmpSecs);
+
+        my $tmpNow = &expandDateStamp($now);
+        $tmpNow = `date -d '$tmpNow' +%s`;
+        chomp($tmpNow);
+
+        my $diff = $tmpNow - $tmpSecs;
+
+        if ( $diff < 2419200 )
+        {
+            &debug( 14, "Archive taken within month: $archive" );
+            $chk = 1;
+        }
+
+    }
+
+    if ( !$chk )
+    {
+        $archiveFinal = "monthly";
+        &debug( 14, "Setting archive to: $archiveFinal" );
+    }
+
+    if ( !$archiveFinal )
+    {
+
+        if ( @monthly < 1 )
+        {
+            $archiveFinal = "monthly";
+        }
+
+        if ( @weekly < 1 )
+        {
+            $archiveFinal = "weekly";
+        }
+
+        if ( @daily < 1 )
+        {
+            $archiveFinal = "daily";
+        }
+
+        if ( @hourly < 1 )
+        {
+            $archiveFinal = "hourly";
+        }
+    }
+
+    &debug( 12, "Backup set to: $archiveFinal" );
+
+    if ( @hourly < 1 )
+    {
+
+# If we don't have an hourly - then we have nothing.  This whole snippit of code is to get at least ONE current backup in place.  The next section will link to this backup
+        &debug( 15, "No hourly backup found - Running hourly backup" );
+        $archiveFinal = "$archiveDest/$now\.hourly";
+
+        if ( $type eq "cifs" )
+        {
+            &getServerMounted( $path, $mntDest, $un, $pw );
+        }
+
+        if ( $type eq "ssh" || &isServerMounted( $path, $mntDest ) )
+        {
+
+            my $cmd          = undef;
+            my $debugOptions = undef;
+
+            # Always add -P now that logs are different
+            $debugOptions = ' -P ';
+
+            my $excludes = undef;
+
+            foreach my $exclude ( @{ $config->{'servers'}[$c]->{'exclude'} } )
+            {
+                &debug( 19, "Adding exclude: $exclude" );
+                $excludes .= " --exclude='" . $exclude . "' ";
+            }
+
+            if ( $type eq "cifs" )
+            {
+                $cmd = "$CMD_RSYNC -ravxz $excludes $debugOptions $mntDest/ $archiveFinal/ >> $logFile";
+            }
+            else
+            {
+                $cmd =
+"$CMD_RSYNC -rxzav -e ssh $excludes $debugOptions $un\@$path/ $archiveFinal/ >> $logFile";
+            }
+
+            &debug( 19, "CMD: $cmd" );
+	    $? = 0; # Fixes a bug where system doesn't set error status on success
+            system($cmd);
+
+            if ( $? == -1 )
+            {
+                &debug( 18, "Failed to execute: $! - $cmd" );
+                exit(-1);
+            }
+            elsif ( $? & 127 )
+            {
+                my $signal = $? & 127;
+                &debug( 18, "Child died with signal: $signal" );
+                exit($signal);
+            }
+            else
+            {
+                my $error = $? >> 8;
+                exit($error);
+            }
+
+        }
+
+        if ( $type eq "cifs" )
+        {
+
+            $cmd = "umount $mntDest";
+            system($cmd);
+
+            if ( &isServerMounted( $path, $mntDest ) )
+            {
+                &sError("Could not unmount $mntDest");
+            }
+        }
+
+        exit(0);
+
+    }
+
+    # If we have an hourly backup then we perform our normal backup routine.
+
+    if ( @hourly >= 1 )
+    {
+        my $date     = undef;
+        my $linkDest = undef;
+
+        $linkDest = &getLatestArchive( \@archiveList );
+
+	my $exitValue = 0; # Get the exit value of the RSYNC and report it with this var
+
+        if ( !$archiveFinal )
+        {
+            &debug( 11, "No backup of [$config->{'servers'}[$c]->{'name'}[0]] is necessary..." );
+            exit($exitValue);
+
+        }
+
+        $archiveFinal = "$archiveDest/$now\.$archiveFinal";
+
+        if ( $type eq "cifs" )
+        {
+            &getServerMounted( $path, $mntDest, $un, $pw );
+        }
+
+        if ( $type eq "ssh" || &isServerMounted( $path, $mntDest ) )
+        {
+
+            my $cmd          = undef;
+            my $debugOptions = undef;
+
+            # Always add -P now that logs are different
+            $debugOptions = ' -P ';
+
+            my $excludes = undef;
+
+            foreach my $exclude ( @{ $config->{'servers'}[$c]->{'exclude'} } )
+            {
+                &debug( 19, "Adding exclude: $exclude" );
+                $excludes .= " --exclude='" . $exclude . "' ";
+            }
+
+            if ( $type eq "cifs" )
+            {
+                $cmd = "$CMD_RSYNC -rxzav $excludes $debugOptions --link-dest='$linkDest' '$mntDest/' '$archiveFinal/' >> $logFile";
+            }
+            else
+            {
+                $cmd =
+"$CMD_RSYNC -xzrav -e ssh $excludes $debugOptions --link-dest=$linkDest $un\@$path/ $archiveFinal/ >> $logFile";
+            }
+
+            &debug( 19, "CMD: $cmd" );
+	    $? = 0;
+	    if (system($cmd) != 0)
+	    {
+
+		if ( $? == -1 )
+		{
+		    &debug( 18, "Failed to execute: $! - $cmd" );
+		    $exitValue = -1;
+		}
+		elsif ( $? & 127 )
+		{
+		    my $signal = $? & 127;
+		    &debug( 18, "Child died with signal: $signal" );
+		    $exitValue = $signal;
+		}
+		else
+		{
+		    my $error = $? >> 8;
+		    $exitValue = $error;
+		}
+	    }
+
+        }
+
+        if ( $type eq "cifs" )
+        {
+
+            $cmd = "umount $mntDest";
+            system($cmd);
+
+            if ( &isServerMounted( $path, $mntDest ) )
+            {
+                &sError("Could not unmount $mntDest");
+            }
+
+        }
+
+    }
+
+    ## Time to clean up our archives to match our configured threshholds
+
+    ## Lets refresh our file lists now that we've done a bunch of backups
+
+    @hourly  = `ls -d $archiveDest/*.hourly`;
+    @weekly  = `ls -d $archiveDest/*.weekly`;
+    @daily   = `ls -d $archiveDest/*.daily`;
+    @monthly = `ls -d $archiveDest/*.monthly`;
+
+    &debug( 1, "Cleaning up old Archives" );
+    if ( @monthly > $config->{'servers'}[$c]->{'numofmonthly'}[0] )
+    {
+        my $chk = @monthly;
+
+        my $diff = $chk - $config->{'servers'}[$c]->{'numofmonthly'}[0];
+
+        &debug( 2, "Removing [$diff] monthly backups" );
+
+        for ( my $c = 0 ; $c < $diff ; $c++ )
+        {
+            @monthly = `ls -d $archiveDest/*.monthly`;
+            my $dir = &getOldestArchive( \@monthly );
+            &debug( 3, "Removing archive: $dir" );
+            if ( -d $dir )
+            {
+                $cmd = "rm -r -f $dir";
+                system($cmd);
+            }
+        }
+
+    }
+
+    if ( @weekly > $config->{'servers'}[$c]->{'numofweekly'}[0] )
+    {
+        my $chk = @weekly;
+
+        my $diff = $chk - $config->{'servers'}[$c]->{'numofweekly'}[0];
+
+        &debug( 2, "Removing [$diff] weekly backups" );
+
+        for ( my $c = 0 ; $c < $diff ; $c++ )
+        {
+            @weekly = `ls -d $archiveDest/*.weekly`;
+            my $dir = &getOldestArchive( \@weekly );
+            &debug( 3, "Removing archive: $dir" );
+            if ( -d $dir )
+            {
+                $cmd = "rm -r -f $dir";
+                system($cmd);
+            }
+        }
+    }
+
+    if ( @daily > $config->{'servers'}[$c]->{'numofdaily'}[0] )
+    {
+        my $chk = @daily;
+
+        my $diff = $chk - $config->{'servers'}[$c]->{'numofdaily'}[0];
+
+        &debug( 2, "Removing [$diff] daily backups" );
+
+        for ( my $c = 0 ; $c < $diff ; $c++ )
+        {
+            @daily = `ls -d $archiveDest/*.daily`;
+            my $dir = &getOldestArchive( \@daily );
+            &debug( 3, "Removing archive: $dir" );
+            if ( -d $dir )
+            {
+                $cmd = "rm -r -f $dir";
+                system($cmd);
+            }
+        }
+    }
+
+    if ( @hourly > $config->{'servers'}[$c]->{'numofhourly'}[0] )
+    {
+        my $chk = @hourly;
+
+        my $diff = $chk - $config->{'servers'}[$c]->{'numofhourly'}[0];
+
+        &debug( 2, "Removing [$diff] hourly backups" );
+
+        for ( my $c = 0 ; $c < $diff ; $c++ )
+        {
+            @hourly = `ls -d $archiveDest/*.hourly`;
+            my $dir = &getOldestArchive( \@hourly );
+            &debug( 3, "Removing archive: $dir" );
+            if ( -d $dir )
+            {
+                $cmd = "rm -r -f $dir";
+                system($cmd);
+            }
+        }
+    }
+
+    ## Create a sym link to a friendly name for easy restoring
+    my $fn = $config->{'servers'}[$c]->{'name'}[0];
+
+    my $fp = $config->{'static'}[0]->{'DIR_ARCHIVES'}[0];
+
+    my $fullName = "$fp/$fn";
+
+    if ( !-d $fullName )
+    {
+        &debug( 2, "Creating symlink:  $fullName" );
+        $cmd = "ln -s '$config->{'static'}[0]->{'DIR_ARCHIVES'}[0]/$id' '$fullName';";
+        &debug( 9, "CMD: $cmd" );
+        system($cmd);
+    }
+
+    exit($exitValue);  # We exit with the return code of the rsync
+
+}
+
+# Always should be run in a child process and should exit with $rsync status
+sub startOffsite
+{
+
+    my $c = shift;
+
+    my $name        = $config->{'servers'}[$c]->{'name'}[0];
+    my $id          = $config->{'servers'}[$c]->{'id'}[0];
+    my $mntDest     = "$config->{'static'}[0]->{'DIR_MOUNTS'}[0]/$id";
+    my $archiveDest = "$config->{'static'}[0]->{'DIR_ARCHIVES'}[0]/$id";
+    my $offsiteDest = "$config->{'static'}[0]->{'DIR_OFFSITES'}[0]/$id/";
+    my $logFile     = "$config->{'static'}[0]->{'DIR_LOGS'}[0]/backups_offsite_$name.txt";
+
+    my @archiveList = `ls -d $archiveDest/*`;
+
+    my $archiveFinal = &getLatestArchive( \@archiveList ) . "/";
+
+    my $CMD_RSYNC = $state->{'CMD_RSYNC'}[0];
+
+    if ( $config->{'static'}[0]->{'VAR_DO_OFFSITES'}[0] )
+    {
+
+        if ($isSafeToDeleteStaleOffsites)
+        {
+            $options .= " --delete ";
+        }
+
+        &debug( 11, "Starting offsite for $name" );
+
+        $cmd = "$CMD_RSYNC -rzav $options -e ssh -P $archiveFinal $offsiteDest >> $logFile";
+        &debug( 19, "CMD: $cmd" );
+
+	$? = 0;
+
+	if (system($cmd) != 0)
+	{
+
+	    if ( $? == -1 )
+	    {
+		&debug( 18, "Failed to execute: $! - $cmd" );
+		exit(-1);
+	    }
+	    elsif ( $? & 127 )
+	    {
+		my $signal = $? & 127;
+		&debug( 18, "Child died with signal: $signal" );
+		exit($signal);
+	    }
+	    else
+	    {
+		my $error = $? >> 8;
+		exit($error);
+	    }
+	}
+
+    }
+
+    exit(0);
+
+}
+
+# Output the status of all our backups
+sub doOutputJobStatus
+{
+
+    my $output = shift;
+
+    if ( !$output )
+    {
+        $output = *STDOUT;
+    }
+
+    print $output "----------------------Status Update-----------------------\n";
+    print $output "\n";
+    print $output "Total Onsites Running:  $runningOnsites\n";
+    print $output "Total Offsites Running: $runningOffsites\n";
+    print $output "Total Backups Running:  $runningChildren\n";
+    print $output "\n";
+
+    my $count = @{ $config->{'servers'} };
+
+    for ( my $c = 0 ; $c < $count ; $c++ )
+    {
+
+        my $name = $config->{'servers'}[$c]->{'name'}[0];
+
+        if ( $config->{'servers'}[$c]->{'onsiteRunning'} )
+        {
+            my $startTime    = $config->{'servers'}[$c]->{'onsiteStartTime'};
+            my $startSeconds = $config->{'servers'}[$c]->{'onsiteStartSeconds'};
+
+            print $output "Onsite $name: \n";
+            print $output "                 Start [$startTime] ";
+            if ( $config->{'servers'}[$c]->{'onsiteEndTime'} )
+            {
+                print $output "\n";
+                my $endTime    = $config->{'servers'}[$c]->{'onsiteEndTime'};
+                my $endSeconds = $config->{'servers'}[$c]->{'onsiteEndSeconds'};
+                my $totalSecs  = $endSeconds - $startSeconds;
+                print $output "                 End [$endTime] \n";
+                print $output "                 Total Seconds [$totalSecs] \n";
+
+            }
+            else
+            {
+                print $output " - RUNNING! \n";
+            }
+        }
+
+        if ( $config->{'servers'}[$c]->{'offsiteRunning'} )
+        {
+            my $startTime    = $config->{'servers'}[$c]->{'offsiteStartTime'};
+            my $startSeconds = $config->{'servers'}[$c]->{'offsiteStartSeconds'};
+
+            print $output "Offsite $name: \n";
+            print $output "                 Start [$startTime] ";
+            if ( $config->{'servers'}[$c]->{'offsiteEndTime'} )
+            {
+                print $output "\n";
+                my $endTime    = $config->{'servers'}[$c]->{'offsiteEndTime'};
+                my $endSeconds = $config->{'servers'}[$c]->{'offsiteEndSeconds'};
+                my $totalSecs  = $endSeconds - $startSeconds;
+                print $output "                 End [$endTime] \n";
+                print $output "                 Total Seconds [$totalSecs] \n";
+            }
+            else
+            {
+                print $output " - RUNNING! \n";
+            }
+        }
+    }
+
+    print $output "---------------------------END----------------------------\n";
+
+}
+
+sub createConfigTemplates
+{
+
+    &debug( 11, "Creating configuration templates..." );
+    print STDOUT "Saving configuration files...";
+    if ( -f $configFile )
+    {
+        print STDOUT "Exists!\n";
+        return (undef);
+    }
+    $config->{'servers'}[0]->{'name'}     = 'example.server.com';
+    $config->{'servers'}[0]->{'path'}     = '//ip.address.com/windows_share_name OR ip.address.com:<path> [leave off trailing slash (/)]';
+    $config->{'servers'}[0]->{'username'} = 'USER_NAME';
+    $config->{'servers'}[0]->{'password'} = 'PASSWORD';
+    $config->{'servers'}[0]->{'type'}     = 'cifs OR ssh (note.. the path changes if ssh)';
+
+    $config->{'servers'}[0]->{'numofhourly'}  = 23;
+    $config->{'servers'}[0]->{'numofdaily'}   = 7;
+    $config->{'servers'}[0]->{'numofweekly'}  = 4;
+    $config->{'servers'}[0]->{'numofmonthly'} = 13;
+
+    $config->{'static'}->{'DIR_MOUNTS'}        = '/var/bp-backupmanager/mounts';
+    $config->{'static'}->{'DIR_ARCHIVES'}      = '/home/backups';
+    $config->{'static'}->{'DIR_OFFSITES'}      = 'root@offsite1.beginnerprise.com:/mnt/backups';
+    $config->{'static'}->{'DIR_LOGS'}          = '/tmp';
+    $config->{'static'}->{'FILE_RUNLOCK'}      = '/var/bp-backupmanager/running.lock';
+    $config->{'static'}->{'FILE_STATEFILE'}    = '/var/bp-backupmanager/state.conf';
+    $config->{'static'}->{'FILE_STOP_BACKUPS'} = '/tmp/stopbackups';
+    $config->{'static'}->{'VAR_RUNFREQUEnCY'}  = 1;
+    $config->{'static'}->{'VAR_DO_OFFSITES'}   = 0;
+    $config->{'static'}->{'VAR_MAX_CHILDREN'}  = 8;
+    $config->{'static'}->{'VAR_MAX_OFFSITE'}   = 3;
+    $config->{'static'}->{'VAR_MAX_ONSITE'}    = 5;
+    $config->{'static'}->{'VAR_STATUS_PORT'}   = 5000;
+
+    $stateFile = $config->{'static'}->{'FILE_STATEFILE'};
+    if ( !-d $configDir )
+    {
+        `mkdir -p $configDir`;
+        if ( !-d $configDir )
+        {
+            &hError("Could not create $configDir");
+        }
+    }
+    if ( !-f $configFile )
+    {
+        &saveConfig( $configFile, $config );
+    }
+    print STDOUT "Done\n";
+}
+
+#######################################################
+## Helper subroutines
+#######################################################
+
+sub zombieKiller
+{
+
+    my $pid;
+    while ( ( $pid = waitpid( -1, &WNOHANG ) ) > 0 )    # Check for our kids
+    {
+        my $count = @{ $config->{'servers'} };
+
+        if ( $pid == -1 )
+        {
+
+            # no child waiting.  Ignore it.
+        }
+        elsif ( WIFEXITED($?) )
+        {
+
+            for ( my $c = 0 ; $c < $count ; $c++ )
+            {
+                if ( $config->{'servers'}[$c]->{'onsiteRunning'} == $pid )
+                {
+                    &debug( 19, "Onsite PID has died for $config->{'servers'}[$c]->{'name'}[0] - $pid" );
+                    my $endTime    = `date`;
+                    my $endSeconds = `date +%s`;
+                    chomp($endTime);
+                    chomp($endSeconds);
+		    if (! $config->{'servers'}[$c]->{'onsiteEndTime'})
+		    {
+			$runningChildren--;
+			$runningOnsites--;
+			$config->{'servers'}[$c]->{'onsiteEndTime'}    = $endTime;
+			$config->{'servers'}[$c]->{'onsiteEndSeconds'} = $endSeconds;
+		    }
+                }
+                if ( $config->{'servers'}[$c]->{'offsiteRunning'} == $pid )
+                {
+                    &debug( 19, "Offsite PID has died for $config->{'servers'}[$c]->{'name'}[0] - $pid" );
+                    my $endTime    = `date`;
+                    my $endSeconds = `date +%s`;
+                    chomp($endTime);
+                    chomp($endSeconds);
+		    if (! $config->{'servers'}[$c]->{'offsiteEndTime'})
+		    {
+			$runningChildren--;
+			$runningOffsites--;
+			$config->{'servers'}[$c]->{'offsiteEndTime'}    = $endTime;
+			$config->{'servers'}[$c]->{'offsiteEndSeconds'} = $endSeconds;
+		    }
+                }
+            }
+        }
+    }
+    $SIG{CHLD} = \&zombieKiller;    # Make SURE we don't get another signal before we exit
+}
+
+# Create a socket that allows someone to poll status from us
+sub doCreateSocket
+{
+
+    &debug( 11, "Sub doCreateSocket..." );
+    $socket = new IO::Socket::INET(
+        LocalHost => '127.0.0.1',
+        LocalPort => $statusPort,
+        Proto     => 'tcp',
+        Listen    => 5,
+        Reuse     => 1
+    ) or &hError("Failed to create status socket");
+
+    $select = new IO::Select($socket);
+
+    $select->add($socket);
+
+    # flush after every write
+    $| = 1;
+
+}
+
+sub doProcessSocket
+{
+    &debug( 11, "Sub doProcessSocket..." );
+    if ( @ready = $select->can_read(0) )
+    {
+        foreach $tmpSocket (@ready)
+        {
+            if ( $tmpSocket == $socket )
+            {
+
+                # Create a new socket
+                $peer = $tmpSocket->accept();
+                &doOutputJobStatus($peer);
+                $peer->close();
+            }
+        }
+    }
+}
+
+sub getStatusOfBackups
+{
+    &debug( 11, "Attempting to get Backup Status..." );
+
+    # flush after every write
+    $| = 1;
+
+    my ( $socket, $client_socket );
+
+    # creating object interface of IO::Socket::INET modules which internally creates
+    # socket, binds and connects to the TCP server running on the specific port.
+    $socket = new IO::Socket::INET(
+        PeerHost => '127.0.0.1',
+        PeerPort => $statusPort,
+        Proto    => 'tcp',
+    ) or die "ERROR in Socket Creation : $!\n";
+
+    while (<$socket>)
+    {
+        print STDOUT $_;
+    }
+}
+
+sub getLatestArchive
+{
+    my $arrRef = shift;
+
+    my $tmpOldest = undef;
+    my $ret       = undef;
+
+    foreach my $file (@$arrRef)
+    {
+        chomp($file);
+        $file =~ /\/(\d\d\d\d\d\d\d\d\d\d\d\d\d\d)\./;
+        my $timeStamp = $1;
+
+        if ( !$tmpOldest )
+        {
+            $tmpOldest = $timeStamp;
+            $ret       = $file;
+            next;
+        }
+
+        if ( $timeStamp > $tmpOldest )
+        {
+            $tmpOldest = $timeStamp;
+            $ret       = $file;
+        }
+    }
+
+    return ($ret);
+
+}
+
+sub getOldestArchive
+{
+    my $arrRef = shift;
+
+    my $tmpOldest = undef;
+    my $ret       = undef;
+
+    foreach my $file (@$arrRef)
+    {
+        chomp($file);
+        $file =~ /\/(\d\d\d\d\d\d\d\d\d\d\d\d\d\d)\./;
+        my $timeStamp = $1;
+
+        if ( !$tmpOldest )
+        {
+            $tmpOldest = $timeStamp;
+            $ret       = $file;
+            next;
+        }
+
+        if ( $timeStamp < $tmpOldest )
+        {
+            $tmpOldest = $timeStamp;
+            $ret       = $file;
+        }
+    }
+
+    return ($ret);
+
+}
+
+sub expandDateStamp
+{
+
+    &debug( 11, "...Sub expandDateStamp" );
+
+    my $ds = shift;
+
+    if ( $ds =~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)/ )
+    {
+        my $ret = "$1-$2-$3 $4:$5:$6";
+        return ($ret);
+    }
+    else
+    {
+        &sError("Date Stampe can not be expanded: $ds");
+    }
+
+    return (undef);
+
+}
+
+sub getSyncDir
+{
+
+    &debug( 11, "...Sub getSyncDir" );
+
+    my $s = shift;
+
+    if ( !-d $s )
+    {
+        &debug( 16, "Sync Dir Does not Exists: $s" );
+        my $cmd = "mkdir -p $s";
+        &debug( 19, "Running: $cmd" );
+        system($cmd);
+
+        if ( !-d $s )
+        {
+            &hError("Could not create sync dir: $s");
+        }
+    }
+    else
+    {
+        &debug( 16, "Sync Dir Exists: $s" );
+    }
+
+    ## Make sure we can write to this dir
+
+    my $tmpfile = "$s/kd234f";
+
+    my $cmd = "touch $tmpfile";
+
+    if ( !-f $tmpfile )
+    {
+        &debug( 16, "Attempting to write to sync dir: $tmpfile" );
+        system($cmd);
+        if ( !-f $tmpfile )
+        {
+            &hError("Failed to write: $tmpfile");
+        }
+        else
+        {
+            &debug( 16, "Write succeeded" );
+            $cmd = "rm $tmpfile";
+            system($cmd);
+        }
+    }
+    else
+    {
+        &debug( 16, "Tempfile already exists: $tmpfile" );
+        $cmd = "rm $tmpfile";
+        system($cmd);
+
+        if ( -f $tmpfile )
+        {
+            &hError("Can not remove tmpfile: $tmpfile");
+        }
+    }
+
+    return (undef);
+}
+
+sub getServerMounted
+{
+
+    &debug( 11, "...Sub getServerMounted" );
+
+    my $p  = shift;
+    my $d  = shift;
+    my $un = shift;
+    my $pw = shift;
+
+    if ( $p eq "" )
+    {
+        &hError("Path failed in getServerMount");
+    }
+
+    if ( &isServerMounted( $p, $d ) )
+    {
+        &debug( 15, "Path already mounted [$p]: $d" );
+        return (undef);
+    }
+
+    if ( !-d $d )
+    {
+        &debug( 14, "Destination for mount [$p] doesn't exist: $d" );
+        $cmd = "mkdir -p $d";
+        system($cmd);
+
+        if ( !-d $d )
+        {
+            &hError("Couldn't create mount dir: $d");
+        }
+        else
+        {
+            &debug( 14, "Created mount dir: $d" );
+        }
+    }
+
+    $cmd = "mount -t cifs -o username='$un',password='$pw',soft '$p' '$d'";
+    &debug( 19, "Running: $cmd" );
+    system($cmd);
+
+    if ( !&isServerMounted( $p, $d ) )
+    {
+        &sError("Could not mount [$p] to [$d]");
+    }
+
+    #`rm $mountLock`;
+
+}
+
+sub isServerMounted
+{
+
+    &debug( 11, "...Sub isServerMounted" );
+
+    my $p = shift;
+    my $d = shift;
+
+    open( IN, "< /proc/mounts" );
+    my @lines = <IN>;
+    close(IN);
+
+    foreach my $line (@lines)
+    {
+        $p    =~ s/\s/\\040/;
+        $line =~ /^(.*)\s+(\/.*?)\s+.*$/;
+        if ( $p eq $1 && $d eq $2 )
+        {
+            &debug( 15, "Found mount [$p] to [$d]" );
+            return (1);
+        }
+    }
+
+    &debug( 15, "Did not find mount [$p] to [$d]" );
+    return (0);
+
+}
+
+sub usage
+{
+
+    print <<"    EOF";
+
+    Beginnerprise Backup Processor
+    Beginnerprise Corporation (C) 2002-2012
+    -----------------------------------------------------------------------------------------
+
+	Usage:
+
+	$0 [-xrh] [-d debug_level] [-c config_file] [-i] [-s stop file]
+
+	    -c Location of the config file to use
+	       [Default: $configFile]
+
+	    -d Debug Level
+
+	    -h This help
+
+	    -r Run the backup
+
+	    -i Create configuration and state file templates and default install dirs
+
+	    -s When this file exists on the file system backups stop after the
+	       current one finishes [Default: $stopBackupsFile]
+
+	    -x Remove stale data from offsites (WARNING: Be SURE onsites are stable)
+
+    EOF
+
+}
+
+sub shutdown
+{
+    $state->{'VAR_LASTRUN'}[0] = `date +%s`;
+    chomp( $state->{'VAR_LASTRUN'}[0] );
+
+    &saveConfig( $stateFile, $state );
+
+    `rm $config->{'static'}[0]->{'FILE_RUNLOCK'}[0]`;
+    `rm $mountLock`;
+
+    exit(0);
+}
+
+sub initialize
+{
+
+    use Getopt::Std;
+
+    my $chk = getopts( 'hirxc:d:s:', \%opts );
+
+    if ( !$chk )
+    {
+        &usage();
+        exit(0);
+    }
+
+    if ( $opts{'d'} )
+    {
+        &setDebugLevel( $opts{'d'} );
+        &debug( 1, "Enabling Debug Information at level [$opts{'d'}]" );
+    }
+
+    if ( $opts{'h'} )
+    {
+        &usage();
+        exit(0);
+    }
+
+    if ( $opts{'c'} )
+    {
+        $configFile = $opts{'c'};
+        &debug( 11, "Setting Config File to: $configFile" );
+    }
+
+    if ( $opts{'x'} )
+    {
+        $isSafeToDeleteStaleOffsites = 1;
+    }
+
+    if ( $opts{'i'} )
+    {
+        &createConfigTemplates();
+        exit(0);
+    }
+
+    if ( !-f $configFile )
+    {
+        &hError("Config file not found: $configFile (try -i)");
+    }
+    else
+    {
+        $config = &readConfig($configFile);
+    }
+
+    if ( $opts{'s'} )
+    {
+        $stopBackupsFile = $opts{'s'};
+    }
+    elsif ( $config->{'static'}[0]->{'FILE_STOP_BACKUPS'}[0] )
+    {
+        $stopBackupsFile = $config->{'static'}[0]->{'FILE_STOP_BACKUPS'}[0];
+    }
+
+    if ( $config->{'static'}[0]->{'VAR_STATUS_PORT'}[0] )
+    {
+        $statusPort = $config->{'static'}[0]->{'VAR_STATUS_PORT'}[0];
+    }
+
+    if ( -f $config->{'static'}[0]->{'FILE_RUNLOCK'}[0] )
+    {
+        &debug( 11, "Runlock file exists - checking stale" );
+        my $oldPid = `cat $config->{'static'}[0]->{'FILE_RUNLOCK'}[0]`;
+        chomp($oldPid);
+	&debug( 12, "Old PID: $oldPid" );
+        my $ret = `ps auxw | grep $oldPid | grep bp-backupmanager | grep -v grep`;
+	&debug( 12, "Process Table Shows: $ret" );
+        chomp($ret);
+        if ( $ret ne "" )
+        {
+            &debug( 1, "Already running or stale lock file:  $config->{'static'}[0]->{'FILE_RUNLOCK'}[0]" );
+            &getStatusOfBackups();
+            exit(0);
+        }
+        else
+        {
+            &debug( 1, "Found stale lock file for PID [$oldPid]" );
+        }
+    }
+
+    if ( !$opts{'r'} )
+    {
+	&debug( 12, "Not supposed to run backup - Exiting ");
+	exit(0);
+    }
+
+    if ( $config->{'static'}[0]->{'FILE_STATEFILE'}[0] ne "" )
+    {
+        $stateFile = $config->{'static'}[0]->{'FILE_STATEFILE'}[0];
+
+        if ( -f $stateFile )
+        {
+            $state = &readConfig($stateFile);
+        }
+    }
+
+    $chk = `date +%s`;
+    chomp($chk);
+
+    if ( $chk - $state->{'VAR_LASTRUN'}[0] < $config->{'static'}[0]->{'VAR_RUNFREQUEnCY'}[0] )
+    {
+        $chk = $chk - $config->{'static'}[0]->{'VAR_LASTRUN'}[0] - $config->{'static'}[0]->{'VAR_RUNFREQUEnCY'}[0];
+        &debug( 3, "Will not run for another [$chk] second(s)" );
+        exit(0);
+    }
+
+    if ( !$state->{'CMD_RSYNC'}[0] )
+    {
+        $state->{'CMD_RSYNC'}[0] = `which rsync`;
+        chomp( $state->{'CMD_RSYNC'}[0] );
+        if ( !$state->{'CMD_RSYNC'}[0] )
+        {
+            &hError("Unable to find rsync");
+        }
+    }
+
+    if ( !-d $config->{'static'}[0]->{'DIR_MOUNTS'}[0] )
+    {
+        `mkdir -p $config->{'static'}[0]->{'DIR_MOUNTS'}[0]`;
+
+        if ( !-d $config->{'static'}[0]->{'DIR_MOUNTS'}[0] )
+        {
+            &hError("Failed to create $config->{'static'}[0]->{'DIR_MOUNTS'}[0]");
+        }
+    }
+
+    if ( !-d $config->{'static'}[0]->{'DIR_ARCHIVES'}[0] )
+    {
+        `mkdir -p $config->{'static'}[0]->{'DIR_ARCHIVES'}[0]`;
+
+        if ( !-d $config->{'static'}[0]->{'DIR_ARCHIVES'}[0] )
+        {
+            &hError("Failed to create $config->{'static'}[0]->{'DIR_ARCHIVES'}[0]");
+        }
+    }
+
+    if ( $config->{'static'}[0]->{'VAR_MAX_CHILDREN'}[0] )
+    {
+        $maxChildren = $config->{'static'}[0]->{'VAR_MAX_CHILDREN'}[0];
+    }
+
+    if ( $config->{'static'}[0]->{'VAR_MAX_ONSITE'}[0] )
+    {
+        $maxOnsites = $config->{'static'}[0]->{'VAR_MAX_ONSITE'}[0];
+    }
+
+    if ( $config->{'static'}[0]->{'VAR_MAX_OFFSITE'}[0] )
+    {
+        $maxOffsites = $config->{'static'}[0]->{'VAR_MAX_OFFSITE'}[0];
+    }
+
+
+    `echo $$ > $config->{'static'}[0]->{'FILE_RUNLOCK'}[0]`;
+
+    &doCreateSocket();
+
+    return (undef);
+
+}
+
+##
+# Don't allow multiple threads to try to mount at the same time
+##
+sub getMountLock()
+{
+
+    if (-f $mountLock)
+    {
+        if (`cat $mountLock` == $$)
+        {
+            return 1;
+        }
+        else
+        {
+            # Check if it's stale;
+        }
+    }
+    else
+    {
+        if (!-f $mountLock)
+        {
+            `echo $$ > $mountLock`;
+
+            if (`cat $mountLock` == $$)
+            {
+                return 1;
+            }
+            else
+            {
+                return;
+            }
+        }
+
+    }
+
+    return;
+
+}
+
+
+&main(0);
+&shutdown();
