@@ -1,0 +1,6 @@
+Package: bp-perl-modules
+Version: 1.1
+Architecture: all
+Maintainer: Information Technology <bhudgens@beginnerprise.com>
+Depends: libclass-dbi-mysql-perl, libdbd-mysql-perl, libxml-dumper-perl, expat, libexpat1, libexpat1-dev, make, libxml-simple-perl
+description: Adds the Beginnerprise Perl Modules
