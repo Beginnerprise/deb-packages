@@ -1,0 +1,7 @@
+Package: bp-server-default-packages
+Version: 0.1
+Depends: vim-nox,bp-perl-modules,bp-server-nrpe,bp-server-tools,ntp,rsync,bp-server-ldap-auth,exim4,openssh-server,screen,less,lvm2,sysstat,bonnie++
+Architecture: all
+Maintainer: Software Engineering <engineering@beginnerprise.com>
+Description: Primary Beginnerprise Debian Server Package Dependancies
+ This package contains all the appropriate server package dependancies
