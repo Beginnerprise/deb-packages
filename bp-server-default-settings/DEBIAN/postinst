@@ -1,0 +1,86 @@
+#!/usr/bin/perl
+
+if ($ARGV[0] eq "configure")
+{
+
+  ### Configure VIM Settings for the root user
+  open(OUT,">/root/.vimrc");
+  print OUT "set si\n";
+  print OUT "set sw=4\n";
+  print OUT "set nu\n";
+  print OUT "syn on\n";
+  print OUT "filetype plugin indent on\n";
+  close(OUT);
+
+  ### Log out idle users after 30 minutes
+  system('echo "tmout=1800" >> /etc/profile');
+
+  ### Send all crom mail to internalsupport@srbok.com
+  system('sed -i.backup -e \'s/^root:.*$/root: internalsupport@srbok.com/\' /etc/aliases');
+
+  ### Disable Root Logins
+  #system('sed -i.backup -e \'s/^PermitRootLogin yes$/PermitRootLogin no/\' /etc/ssh/sshd_config');
+  #system('/etc/init.d/ssh restart');
+
+  ### Configure APT Repositories
+  open(OUT,">/etc/apt/sources.list");
+  print OUT <<"  EOF";
+  # Primary Repositories
+  deb http://ftp.us.debian.org/debian/ wheezy main contrib non-free
+  deb-src http://ftp.us.debian.org/debian/ wheezy main contrib non-free
+
+  # Security Updates
+  deb http://security.debian.org/ wheezy/updates main contrib non-free
+  deb-src http://security.debian.org/ wheezy/updates main contrib non-free
+
+  # Package Updates
+  deb http://ftp.us.debian.org/debian/ wheezy-updates main contrib non-free
+  deb-src http://ftp.us.debian.org/debian/ wheezy-updates main contrib non-free
+
+  # Local Package Repository
+  deb http://debian.srb.local/ wheezy main
+  EOF
+  close(OUT);
+
+  ### Send all crom mail to internalsupport@beginnerprise.com
+  system('sed -i.backup -e \'s/^root:.*$/root: internalsupport@beginnerprise.com/\' /etc/aliases');
+
+
+  ### Disable mpt-status
+  system('/etc/init.d/mpt-statusd stop');
+  system('echo RUN_DAEMON=no > /etc/default/mpt-statusd');
+
+
+  ### Configure Mail System to use smart host if necessary
+  &check_mail_system();
+}
+
+sub check_mail_system()
+{
+  open(IN,"< /etc/exim4/update-exim4.conf.conf");
+  @lines = <IN>;
+  close(IN);
+
+  foreach my $line (@lines)
+  {
+    if ($line =~ /dc_eximconfig_configtype/)
+    {
+      if ($line !~ /satellite/)
+      {
+        print "\n\nThe mail system does not appear to be setup correctly to send email.  Configure?  [Y|n] ";
+        $input = <STDIN>;
+        if ($input =~ /n/i)
+        {
+          last;
+        }
+        else
+        {
+          $cmd = "dpkg-reconfigure exim4-config";
+          system($cmd);
+          &check_mail_system();
+          last;
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+Package: bp-server-default-settings
+Version: 0.1
+Depends: bp-server-default-packages
+Architecture: all
+Maintainer: Software Engineering <engineering@beginnerprise.com>
+Description: Primary Beginneprise Debian Server Configuration Settings Package
+ This package contains all the appropriate server settings for a debian server
