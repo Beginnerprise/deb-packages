@@ -1,0 +1,140 @@
+#! /usr/bin/perl
+
+doing("Looking for Control File");
+if (!-f 'DEBIAN/control') { failed(); exit(1) };
+done();
+
+doing("Getting Package Name");
+$package = `cat DEBIAN/control | grep Package:`;
+chomp($package);
+$package =~ s/Package//g;
+$package =~ s/://g;
+$package =~ s/ //g;
+done($package);
+
+doing("Checking Version Number");
+$version = `cat DEBIAN/control | grep Version:`;
+chomp($version);
+$version =~ s/Version//g;
+$version =~ s/://g;
+$version =~ s/ //g;
+$version =~ s/\$//g;
+$version =~ s/Revision//g;
+if ($version !~ /\d+/) {
+  system("svn propset svn:keywords 'Revision' DEBIAN/control");
+  system("svn commit -m 'Keyword Tagging Control File' DEBIAN/control");
+
+  $version = `cat DEBIAN/control | grep Version:`;
+  chomp($version);
+  $version =~ s/Version//g;
+  $version =~ s/://g;
+  $version =~ s/ //g;
+  $version =~ s/\$//g;
+  $version =~ s/Revision//g;
+  if ($version !~ /\d+/) {
+    failed("Couldn't get version from control file");
+    exit();
+  }
+}
+open(IN,"<DEBIAN/control");
+open(OUT,">DEBIAN/control.tmp");
+while (<IN>) {
+  s/Version:.*/Version: $version/;
+  print OUT;
+}
+close(OUT);
+close(IN);
+done($version);
+
+doing("Writing Control File");
+`mv DEBIAN/control.tmp DEBIAN/control`;
+done();
+
+doing("Checking for Makefile template");
+if (!-f './Makefile.in') { failed("Makefile.in not found"); exit() };
+done();
+
+
+doing("Generating Makefile");
+open(IN,"<Makefile.in");
+open(OUT,">Makefile.tmp");
+while (<IN>) {
+  s/__VERSION__/$version/;
+  s/__PACKAGE__/$package/;
+  if (/BUILD_DIRS=(.*)/) {
+    $dirlist=$1;
+    chomp($dirlist);
+    @dirs=split(/ /,$dirlist);
+  }
+  print OUT;
+}
+close(IN);
+close(OUT);
+done();
+
+doing("Checking Makefile dirs Exist");
+foreach my $dir (@dirs) {
+  if (!-d $dir) {
+    failed("Make sure the Makefile.in file has the appropriate BUILD_DIRS");
+    exit(1);
+  }
+}
+done();
+
+doing("Writing Makefile");
+`cp Makefile.tmp Makefile`;
+done();
+
+print "\nConfiguration Complete!\n\n";
+print "Next try:  make\n";
+print "           make install\n\n";
+
+
+
+sub doing {
+
+  my $msg 	= undef;
+
+  $msg	= shift;
+
+  print $msg . "...";
+
+}
+
+sub failed {
+
+  my $msg	= undef;
+
+  $msg	= shift;
+
+  if ($msg eq "") {
+
+    print "failed\n";
+
+  } else {
+
+    print "failed\n";
+
+    print "\n$msg\n\n";
+
+  }
+
+}
+
+sub done {
+
+  my $msg	= undef;
+
+  $msg	= shift;
+
+  if ($msg ne "") {
+
+    print "$msg\n";
+
+  } else {
+
+    print "done\n";
+
+  }
+
+}

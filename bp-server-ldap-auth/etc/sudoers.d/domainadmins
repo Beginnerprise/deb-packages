@@ -1,0 +1,2 @@
+%BEGINNERPRISE\\domain^admins	ALL=(ALL:ALL) ALL
+%domain^admins	ALL=(ALL:ALL) ALL

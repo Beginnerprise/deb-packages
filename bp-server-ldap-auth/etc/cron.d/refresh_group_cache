@@ -1,0 +1,1 @@
+0 *	* * *	root	/opt/pbis/bin/ad-cache --delete-all > /dev/null; getent group | grep uni > /dev/null 2>&1
